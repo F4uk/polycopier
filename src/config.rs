@@ -18,8 +18,12 @@ pub struct Config {
     pub max_copy_loss_pct: Decimal,
     /// Minimum token price for catch-up entries (default 0.02 — filters near-zero dust)
     pub min_entry_price: Decimal,
-    /// Maximum token price for catch-up entries (default 0.98 — allows near-certainty positions)
+    /// Maximum token price for catch-up entries (default 0.999 — allows near-certainty positions)
     pub max_entry_price: Decimal,
+    /// If set, size each trade as this fraction of available balance (e.g. 0.10 = 10%).
+    /// Overrides max_trade_size_usd for sizing but that value still acts as a hard cap.
+    /// If None, always trade exactly max_trade_size_usd.
+    pub copy_size_pct: Option<Decimal>,
 }
 
 /// Returns true if a config value looks like a placeholder that hasn't been filled in.
@@ -135,11 +139,13 @@ impl Config {
             }
         };
 
-        // Price range for catch-up entries — read from env, no prompt (advanced setting)
+        // Price range and proportional sizing — read from env, no prompt (advanced settings)
         let min_entry_price_str =
             env::var("MIN_ENTRY_PRICE").unwrap_or_else(|_| "0.02".to_string());
         let max_entry_price_str =
             env::var("MAX_ENTRY_PRICE").unwrap_or_else(|_| "0.999".to_string());
+        // COPY_SIZE_PCT is optional — if absent, fixed MAX_TRADE_SIZE_USD is used instead
+        let copy_size_pct_str = env::var("COPY_SIZE_PCT").ok();
 
         if write_new_env {
             println!("Saving credentials to .env...");
@@ -158,6 +164,9 @@ impl Config {
             writeln!(file, "MAX_COPY_LOSS_PCT=\"{}\"", max_copy_loss_str)?;
             writeln!(file, "MIN_ENTRY_PRICE=\"{}\"", min_entry_price_str)?;
             writeln!(file, "MAX_ENTRY_PRICE=\"{}\"", max_entry_price_str)?;
+            if let Some(ref pct) = copy_size_pct_str {
+                writeln!(file, "COPY_SIZE_PCT=\"{}\"", pct)?;
+            };
         }
 
         let target_wallets: Vec<String> = target_wallets_str
@@ -186,7 +195,12 @@ impl Config {
 
         let max_entry_price = max_entry_price_str
             .parse::<Decimal>()
-            .unwrap_or_else(|_| Decimal::from_str("0.98").unwrap());
+            .unwrap_or_else(|_| Decimal::from_str("0.999").unwrap());
+
+        let copy_size_pct = copy_size_pct_str
+            .as_deref()
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .filter(|&p| p > Decimal::ZERO && p <= Decimal::ONE);
 
         Ok(Self {
             private_key,
@@ -199,6 +213,7 @@ impl Config {
             max_copy_loss_pct,
             min_entry_price,
             max_entry_price,
+            copy_size_pct,
         })
     }
 }

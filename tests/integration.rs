@@ -28,7 +28,8 @@ fn test_config() -> polycopier::config::Config {
         max_delay_seconds: 2,
         max_copy_loss_pct: dec!(0.40),
         min_entry_price: dec!(0.02),
-        max_entry_price: dec!(0.998),
+        max_entry_price: dec!(0.999),
+        copy_size_pct: None,
     }
 }
 

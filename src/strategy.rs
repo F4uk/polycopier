@@ -33,6 +33,32 @@ pub fn calculate_entry_size(size: Decimal, price: Decimal, max_trade_usd: Decima
     }
 }
 
+/// Minimum notional the CLOB requires (5 shares × ~$1.00 = $5.00).
+pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(5, 0, 0, false, 0); // 5.00
+
+/// Determine how many USD to spend on a BUY order given:
+/// - `balance`         — current wallet balance in USDC
+/// - `copy_size_pct`   — optional fraction of balance to use (e.g. Some(dec!(0.10)) = 10%)
+/// - `max_trade_usd`   — hard cap; trade is never larger than this regardless of pct
+///
+/// Rules (in priority order):
+/// 1. If `copy_size_pct` is Some, desired = balance × pct; otherwise desired = max_trade_usd.
+/// 2. Floor at MIN_ORDER_USD ($5.00) — the CLOB rejects smaller lots.
+/// 3. Ceiling at max_trade_usd — single trade can never exceed the configured cap.
+pub fn compute_order_usd(
+    balance: Decimal,
+    copy_size_pct: Option<Decimal>,
+    max_trade_usd: Decimal,
+) -> Decimal {
+    let desired = match copy_size_pct {
+        Some(pct) => balance * pct,
+        None => max_trade_usd,
+    };
+    // Enforce floor/ceiling, handling the edge case where max < min (misconfiguration)
+    let floor = MIN_ORDER_USD.min(max_trade_usd);
+    desired.max(floor).min(max_trade_usd)
+}
+
 pub fn start_strategy_engine(
     mut rx: mpsc::Receiver<TradeEvent>,
     state: Arc<RwLock<BotState>>,
@@ -167,8 +193,8 @@ pub fn start_strategy_engine(
                 let limit_price =
                     calculate_limit_price(event.price, event.side, config.max_slippage_pct);
 
-                let actual_size = if is_closing {
-                    // Position existence was already verified above — our_held_size > 0 guaranteed.
+                let order = if is_closing {
+                    // ── SELL: close our position using our held size (not the target's size) ──
                     let fee_factor = Decimal::new(97, 2); // 0.97 — CLOB fee buffer for SELLs
                     let our_held_size = {
                         let guard = state.read().await;
@@ -178,38 +204,51 @@ pub fn start_strategy_engine(
                             .map(|p| p.size)
                             .unwrap_or(Decimal::ZERO)
                     };
-                    (our_held_size * fee_factor).round_dp(2)
+                    let sell_size = (our_held_size * fee_factor).round_dp(2);
+                    Some(OrderRequest {
+                        token_id: event.token_id.clone(),
+                        price: limit_price,
+                        size: sell_size,
+                        side: event.side,
+                    })
                 } else {
-                    // BUY: cap to max_trade_size_usd, then round to 2dp (CLOB lot size)
+                    // ── BUY: proportional or fixed sizing, capped and $5 floored ──
+                    let current_balance = {
+                        let guard = state.read().await;
+                        guard.total_balance
+                    };
+                    let budget_usd = compute_order_usd(
+                        current_balance,
+                        config.copy_size_pct,
+                        config.max_trade_size_usd,
+                    );
                     let size_cost = event.size * event.price;
-                    let raw_size = if size_cost > config.max_trade_size_usd {
-                        config.max_trade_size_usd / event.price
+                    let raw_size = if size_cost > budget_usd {
+                        budget_usd / event.price
                     } else {
                         event.size
                     };
-                    // CLOB requires sizes rounded to 2 decimal places
-                    raw_size.round_dp(2)
+                    let buy_size = raw_size.round_dp(2); // CLOB requires 2dp lot size
+
+                    // Pre-check balance — avoids noisy 400 errors from CLOB
+                    let order_cost = buy_size * limit_price;
+                    if current_balance < order_cost {
+                        warn!(
+                            "Insufficient balance (have ${:.2}, need ${:.2}) — skipping entry",
+                            current_balance, order_cost
+                        );
+                        None
+                    } else {
+                        Some(OrderRequest {
+                            token_id: event.token_id.clone(),
+                            price: limit_price,
+                            size: buy_size,
+                            side: event.side,
+                        })
+                    }
                 };
 
-                let order = OrderRequest {
-                    token_id: event.token_id.clone(),
-                    price: limit_price,
-                    size: actual_size,
-                    side: event.side,
-                };
-
-                // Pre-check balance before submitting — avoids noisy 400 errors from CLOB
-                let order_cost = actual_size * limit_price;
-                let current_balance = {
-                    let guard = state.read().await;
-                    guard.total_balance
-                };
-                if event.side == TradeSide::BUY && current_balance < order_cost {
-                    warn!(
-                        "Insufficient balance (have ${:.2}, need ${:.2}) — skipping entry",
-                        current_balance, order_cost
-                    );
-                } else {
+                if let Some(order) = order {
                     let submitter_clone = submitter.clone();
                     tokio::spawn(async move {
                         if let Err(e) = submitter_clone(order).await {
@@ -265,5 +304,56 @@ mod tests {
         let price = dec!(0.77);
         let result = calculate_limit_price(price, TradeSide::BUY, dec!(0));
         assert_eq!(result, price);
+    }
+
+    // ── compute_order_usd tests ─────────────────────────────────────────────
+
+    #[test]
+    fn proportional_sizing_uses_pct_of_balance() {
+        // 10% of $200 = $20, within $50 cap
+        let usd = compute_order_usd(dec!(200), Some(dec!(0.10)), dec!(50));
+        assert_eq!(usd, dec!(20));
+    }
+
+    #[test]
+    fn proportional_sizing_capped_at_max() {
+        // 10% of $1000 = $100, but cap is $50
+        let usd = compute_order_usd(dec!(1000), Some(dec!(0.10)), dec!(50));
+        assert_eq!(usd, dec!(50));
+    }
+
+    #[test]
+    fn proportional_sizing_floored_at_min() {
+        // 10% of $20 = $2, below $5 minimum → should be $5
+        let usd = compute_order_usd(dec!(20), Some(dec!(0.10)), dec!(50));
+        assert_eq!(usd, dec!(5));
+    }
+
+    #[test]
+    fn fixed_sizing_uses_max_trade_usd_when_no_pct() {
+        let usd = compute_order_usd(dec!(500), None, dec!(10));
+        assert_eq!(usd, dec!(10));
+    }
+
+    #[test]
+    fn floor_applied_when_balance_very_low() {
+        // 10% of $10 = $1, below $5 floor → should try $5 (still within $50 cap)
+        let usd = compute_order_usd(dec!(10), Some(dec!(0.10)), dec!(50));
+        assert_eq!(usd, dec!(5));
+    }
+
+    #[test]
+    fn max_less_than_min_uses_max_as_floor() {
+        // Misconfigured: max_trade = $3, below MIN_ORDER_USD $5.
+        // floor = min($5, $3) = $3; result clamped to $3.
+        let usd = compute_order_usd(dec!(100), Some(dec!(0.10)), dec!(3));
+        assert_eq!(usd, dec!(3));
+    }
+
+    #[test]
+    fn pct_exactly_at_max_returns_max() {
+        // 50% of $100 = $50 = cap exactly
+        let usd = compute_order_usd(dec!(100), Some(dec!(0.50)), dec!(50));
+        assert_eq!(usd, dec!(50));
     }
 }

@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::models::{ScanStatus, TargetPosition, TradeEvent, TradeSide};
 use crate::state::BotState;
+use crate::strategy::compute_order_usd;
 use alloy::primitives::Address;
 use anyhow::Result;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
@@ -152,10 +153,13 @@ async fn scan_positions(
     let max_price = config.max_entry_price;
 
     // Brief read lock to snapshot our current holdings
-    let our_token_ids: HashSet<String> = {
+    let (our_token_ids, current_balance) = {
         let guard = state.read().await;
-        guard.positions.keys().cloned().collect()
+        let ids = guard.positions.keys().cloned().collect();
+        let bal = guard.total_balance;
+        (ids, bal)
     };
+    let our_token_ids: HashSet<String> = our_token_ids;
 
     let mut all_positions: Vec<TargetPosition> = Vec::new();
     let mut to_enter: Vec<(String, TradeEvent)> = Vec::new();
@@ -208,9 +212,12 @@ async fn scan_positions(
             );
 
             if status == ScanStatus::Monitoring && pos.cur_price > Decimal::ZERO {
-                let size = (config.max_trade_size_usd / pos.cur_price)
-                    .min(pos.size)
-                    .round_dp(2);
+                let budget_usd = compute_order_usd(
+                    current_balance,
+                    config.copy_size_pct,
+                    config.max_trade_size_usd,
+                );
+                let size = (budget_usd / pos.cur_price).min(pos.size).round_dp(2);
 
                 if size > Decimal::ZERO {
                     let short_id = &token_id[..token_id.len().min(8)];
