@@ -16,7 +16,7 @@ use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Initialize logging — set to WARN to prevent log lines bleeding into the TUI.
+    // 1. Initialize logging - set to WARN to prevent log lines bleeding into the TUI.
     //    For diagnostic detail run: RUST_LOG=debug cargo run
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::WARN)
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                         tracing::warn!(
-                            "Seeded {} existing position(s) from wallet — scanner will skip these.",
+                            "Seeded {} existing position(s) from wallet - scanner will skip these.",
                             guard.positions.len()
                         );
                     }

@@ -20,9 +20,9 @@ pub struct Config {
     pub max_delay_seconds: i64,
     /// Skip copying a position if the target is already this % underwater (e.g. 0.40 = 40% down)
     pub max_copy_loss_pct: Decimal,
-    /// Minimum token price for catch-up entries (default 0.02 — filters near-zero dust)
+    /// Minimum token price for catch-up entries (default 0.02 -- filters near-zero dust)
     pub min_entry_price: Decimal,
-    /// Maximum token price for catch-up entries (default 0.999 — allows near-certainty positions)
+    /// Maximum token price for catch-up entries (default 0.999 -- allows near-certainty positions)
     pub max_entry_price: Decimal,
     /// Which sizing algorithm to use. See [`SizingMode`] for full docs.
     pub sizing_mode: SizingMode,
@@ -39,7 +39,7 @@ pub fn is_placeholder(val: &str) -> bool {
         || v.starts_with("0xYour")
         || v.starts_with("0xTarget")
         || v.contains("here")
-    // Note: no length check — short numeric values like "2" or "10" are valid
+    // Note: no length check -- short numeric values like "2" or "10" are valid
 }
 
 impl Config {
@@ -143,13 +143,13 @@ impl Config {
             }
         };
 
-        // Price range and proportional sizing — read from env, no prompt (advanced settings)
+        // Price range and proportional sizing -- read from env, no prompt (advanced settings)
         let min_entry_price_str =
             env::var("MIN_ENTRY_PRICE").unwrap_or_else(|_| "0.02".to_string());
         let max_entry_price_str =
             env::var("MAX_ENTRY_PRICE").unwrap_or_else(|_| "0.999".to_string());
 
-        // ── Sizing mode: mutually exclusive, covers all sizing strategies ──
+        // -- Sizing mode: mutually exclusive, covers all sizing strategies --
         let sizing_mode_str = match env::var("SIZING_MODE")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -158,15 +158,15 @@ impl Config {
             None => {
                 write_new_env = true;
                 let options = vec![
-                    "fixed     — always use MAX_TRADE_SIZE_USD",
-                    "self_pct  — % of MY balance (set COPY_SIZE_PCT)",
-                    "target_usd— copy target's exact $ amount (capped at MAX_TRADE_SIZE_USD)",
-                    "target_pct— scale target's portfolio % to my wallet (recommended)",
+                    "fixed     -- always use MAX_TRADE_SIZE_USD",
+                    "self_pct  -- % of MY balance (set COPY_SIZE_PCT)",
+                    "target_usd-- copy target's exact $ amount (capped at MAX_TRADE_SIZE_USD)",
+                    "target_pct-- scale target's portfolio % to my wallet (recommended)",
                 ];
                 let choice = Select::new("Position sizing mode:", options)
                     .with_starting_cursor(3) // default: target_pct
                     .prompt()
-                    .unwrap_or("fixed     — always use MAX_TRADE_SIZE_USD");
+                    .unwrap_or("fixed     -- always use MAX_TRADE_SIZE_USD");
                 // Extract the keyword before the em-dash
                 choice
                     .split_whitespace()

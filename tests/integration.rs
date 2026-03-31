@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashSet;
 
-// ── Shared test helpers ───────────────────────────────────────────────────────
+// -- Shared test helpers -------------------------------------------------------
 
 fn test_config() -> polycopier::config::Config {
     polycopier::config::Config {
@@ -78,7 +78,7 @@ fn token_set(tokens: &[&str]) -> HashSet<String> {
     tokens.iter().map(|s| s.to_string()).collect()
 }
 
-// ── Config: placeholder detection ─────────────────────────────────────────────
+// -- Config: placeholder detection ---------------------------------------------
 
 mod config_tests {
     use polycopier::config::is_placeholder;
@@ -104,7 +104,7 @@ mod config_tests {
         // (the old v.len() < 3 check incorrectly blocked these).
         assert!(!is_placeholder("2"));
         assert!(!is_placeholder("10"));
-        assert!(!is_placeholder("ab")); // ambiguous short string — now accepted
+        assert!(!is_placeholder("ab")); // ambiguous short string - now accepted
     }
 
     #[test]
@@ -134,7 +134,7 @@ mod config_tests {
     }
 }
 
-// ── Models: ScanStatus helpers ────────────────────────────────────────────────
+// -- Models: ScanStatus helpers ------------------------------------------------
 
 mod model_tests {
     use super::*;
@@ -188,7 +188,7 @@ mod model_tests {
     }
 }
 
-// ── State: BotState operations ────────────────────────────────────────────────
+// -- State: BotState operations ------------------------------------------------
 
 mod state_tests {
     use super::*;
@@ -257,7 +257,7 @@ mod state_tests {
         assert!(state.target_positions.is_empty());
     }
 
-    // ── positions HashMap (new: SELL position lookup) ──────────────────────────
+    // -- positions HashMap (new: SELL position lookup) --------------------------
 
     #[test]
     fn position_can_be_inserted_and_retrieved() {
@@ -321,7 +321,7 @@ mod state_tests {
     }
 }
 
-// ── Risk engine ───────────────────────────────────────────────────────────────
+// -- Risk engine ---------------------------------------------------------------
 
 mod risk_tests {
     use super::*;
@@ -341,7 +341,7 @@ mod risk_tests {
     #[test]
     fn micro_trade_below_1_usd_is_rejected() {
         let mut e = engine();
-        // 0.01 * $0.05 = $0.0005 — below $1 minimum
+        // 0.01 * $0.05 = $0.0005 - below $1 minimum
         let result = e.check_trade(&make_trade("0xabc", dec!(0.05), dec!(0.01), TradeSide::BUY));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_lowercase().contains("spoofing"));
@@ -377,7 +377,7 @@ mod risk_tests {
     #[test]
     fn trade_just_above_1_usd_passes() {
         let mut e = engine();
-        // 3 shares * $0.34 = $1.02 — just above the $1 threshold
+        // 3 shares * $0.34 = $1.02 - just above the $1 threshold
         assert!(e
             .check_trade(&make_trade("0xabc", dec!(0.34), dec!(3), TradeSide::BUY))
             .is_ok());
@@ -386,13 +386,13 @@ mod risk_tests {
     #[test]
     fn trade_just_below_1_usd_is_rejected() {
         let mut e = engine();
-        // 1.9 shares * $0.50 = $0.95 — just under $1
+        // 1.9 shares * $0.50 = $0.95 - just under $1
         let result = e.check_trade(&make_trade("0xabc", dec!(0.50), dec!(1.9), TradeSide::BUY));
         assert!(result.is_err());
     }
 }
 
-// ── Strategy: pure price/size helpers ────────────────────────────────────────
+// -- Strategy: pure price/size helpers ----------------------------------------
 
 mod strategy_tests {
     use super::*;
@@ -430,7 +430,7 @@ mod strategy_tests {
 
     #[test]
     fn entry_size_within_budget_is_unchanged() {
-        // 10 * $0.40 = $4 — under $10
+        // 10 * $0.40 = $4 - under $10
         assert_eq!(
             calculate_entry_size(dec!(10), dec!(0.40), dec!(10)),
             dec!(10)
@@ -439,7 +439,7 @@ mod strategy_tests {
 
     #[test]
     fn entry_size_over_budget_is_capped() {
-        // 100 * $0.40 = $40 — over $10 => 10/0.40 = 25
+        // 100 * $0.40 = $40 - over $10 => 10/0.40 = 25
         assert_eq!(
             calculate_entry_size(dec!(100), dec!(0.40), dec!(10)),
             dec!(25)
@@ -464,11 +464,11 @@ mod strategy_tests {
         );
     }
 
-    // ── BUY size minimum floor (new: smoke test $1 fix) ───────────────────────
+    // -- BUY size minimum floor (new: smoke test $1 fix) -----------------------
 
     #[test]
     fn entry_size_targeting_1_10_stays_above_1_usd() {
-        // $1.10 target / $0.52 = 2.115 → rounds to 2.11, total = 2.11 * $0.52 = $1.0972 > $1 ✓
+        // $1.10 target / $0.52 = 2.115 -> rounds to 2.11, total = 2.11 * $0.52 = $1.0972 > $1 +
         let size = calculate_entry_size(dec!(2.115), dec!(0.52), dec!(10));
         let total = size * dec!(0.52);
         assert!(total >= dec!(1.00), "total ${total} should be >= $1.00");
@@ -477,8 +477,8 @@ mod strategy_tests {
     #[test]
     fn entry_size_targeting_1_00_can_round_below_1_usd() {
         // Demonstrates WHY $1.05/$1.10 target is needed:
-        // $1.00 / $0.52 = 1.923 → rounds to 1.92 → 1.92 * $0.52 = $0.9984 < $1
-        // This is the bug we fixed — now we target $1.10 in the smoke test.
+        // $1.00 / $0.52 = 1.923 -> rounds to 1.92 -> 1.92 * $0.52 = $0.9984 < $1
+        // This is the bug we fixed - now we target $1.10 in the smoke test.
         let raw = dec!(1.00) / dec!(0.52); // = 1.923...
         let rounded = (raw * dec!(1)).round_dp(2); // = 1.92
         let total = rounded * dec!(0.52); // = 0.9984
@@ -508,7 +508,7 @@ mod strategy_tests {
     }
 }
 
-// ── Position scanner: classify_position ──────────────────────────────────────
+// -- Position scanner: classify_position --------------------------------------
 
 mod scanner_tests {
     use super::*;
@@ -632,7 +632,7 @@ mod scanner_tests {
 
     #[test]
     fn owned_takes_priority_over_price_range() {
-        // Price is below min AND we own it — owned takes priority
+        // Price is below min AND we own it - owned takes priority
         assert_eq!(
             classify(
                 "t1",
@@ -647,7 +647,7 @@ mod scanner_tests {
 
     #[test]
     fn queued_takes_priority_over_loss() {
-        // Already queued AND deeply underwater — Entered wins
+        // Already queued AND deeply underwater - Entered wins
         assert_eq!(
             classify(
                 "t1",
@@ -697,7 +697,7 @@ mod scanner_tests {
     }
 }
 
-// ── Strategy engine: async end-to-end tests ───────────────────────────────────
+// -- Strategy engine: async end-to-end tests -----------------------------------
 
 mod strategy_engine_tests {
     use super::*;
@@ -806,7 +806,7 @@ mod strategy_engine_tests {
             guard.total_balance = dec!(100);
         }
 
-        // 100 shares * $0.40 = $40 — capped to 10/0.40 = 25 shares
+        // 100 shares * $0.40 = $40 - capped to 10/0.40 = 25 shares
         tx.send(make_trade("0xabc", dec!(0.40), dec!(100), TradeSide::BUY))
             .await
             .unwrap();
@@ -826,7 +826,7 @@ mod strategy_engine_tests {
         let (tx, rx) = mpsc::channel::<TradeEvent>(10);
         start_strategy_engine(rx, state.clone(), risk, mock_submitter(log.clone()), config);
 
-        // $0.05 * 0.01 = $0.0005 — below $1 spoofing threshold
+        // $0.05 * 0.01 = $0.0005 - below $1 spoofing threshold
         tx.send(make_trade("0xabc", dec!(0.05), dec!(0.01), TradeSide::BUY))
             .await
             .unwrap();
@@ -868,11 +868,11 @@ mod strategy_engine_tests {
         assert_eq!(orders[0].side, TradeSide::SELL);
     }
 
-    // ── SELL size: position lookup (new: proportional-close fix) ──────────────
+    // -- SELL size: position lookup (new: proportional-close fix) --------------
 
     #[tokio::test]
     async fn sell_uses_our_held_size_not_target_size() {
-        // Target sells 500 shares; we hold only 20 → SELL should be 20 * 0.97 = 19.40
+        // Target sells 500 shares; we hold only 20 -> SELL should be 20 * 0.97 = 19.40
         let config = test_config();
         let mut init_state = BotState::new();
         init_state.positions.insert(
@@ -895,7 +895,7 @@ mod strategy_engine_tests {
             config.clone(),
         );
 
-        // Target sells 500 shares — we hold only 20
+        // Target sells 500 shares - we hold only 20
         tx.send(make_trade("0xabc", dec!(0.60), dec!(500), TradeSide::SELL))
             .await
             .unwrap();
@@ -913,7 +913,7 @@ mod strategy_engine_tests {
 
     #[tokio::test]
     async fn sell_applies_97_pct_fee_buffer_to_our_position() {
-        // Held: 10 shares → SELL size should be 10 * 0.97 = 9.70
+        // Held: 10 shares -> SELL size should be 10 * 0.97 = 9.70
         let config = test_config();
         let mut init_state = BotState::new();
         init_state.positions.insert(
@@ -948,7 +948,7 @@ mod strategy_engine_tests {
 
     #[tokio::test]
     async fn sell_skipped_when_we_never_entered_targets_long() {
-        // Scanner shows target HAS the position, but we never entered it → skip.
+        // Scanner shows target HAS the position, but we never entered it -> skip.
         let config = test_config();
         let mut init_state = BotState::new();
         // Target holds "99999" but we don't
@@ -981,7 +981,7 @@ mod strategy_engine_tests {
 
     #[tokio::test]
     async fn sell_skipped_when_target_opening_short() {
-        // Target has NO prior scanner position → SELL = opening a short entry.
+        // Target has NO prior scanner position -> SELL = opening a short entry.
         // We cannot replicate shorts, so skip.
         let config = test_config();
         let mut init_state = BotState::new();
@@ -999,7 +999,7 @@ mod strategy_engine_tests {
             config.clone(),
         );
 
-        // Target sells "99999" but has no prior long position → short entry
+        // Target sells "99999" but has no prior long position -> short entry
         tx.send(make_trade("0xabc", dec!(0.60), dec!(10), TradeSide::SELL))
             .await
             .unwrap();
@@ -1016,7 +1016,7 @@ mod strategy_engine_tests {
 
     #[tokio::test]
     async fn buy_skipped_when_target_closing_short_we_are_long() {
-        // We hold a long. Target has NO scanner position → target is likely
+        // We hold a long. Target has NO scanner position -> target is likely
         // closing a short. Copying this BUY would add to our long incorrectly.
         let config = test_config();
         let mut init_state = BotState::new();
@@ -1094,7 +1094,7 @@ mod strategy_engine_tests {
     }
 }
 
-// ── Balance conversion (math sanity check) ────────────────────────────────────
+// -- Balance conversion (math sanity check) ------------------------------------
 
 #[test]
 fn micro_usdc_converts_to_usdc_correctly() {
@@ -1111,7 +1111,7 @@ fn zero_micro_usdc_is_zero_usdc() {
     assert_eq!(usdc, Decimal::ZERO);
 }
 
-// ── Adaptive scan interval tests ──────────────────────────────────────────────
+// -- Adaptive scan interval tests ----------------------------------------------
 
 mod scan_interval_tests {
     use super::*;
@@ -1146,14 +1146,14 @@ mod scan_interval_tests {
 
     #[test]
     fn no_monitoring_positions_returns_max_interval() {
-        // Nothing enterable → no urgency → scan at slowest rate
+        // Nothing enterable -> no urgency -> scan at slowest rate
         let interval = compute_scan_interval(&[], MAX_LOSS);
         assert_eq!(interval, MAX_S);
     }
 
     #[test]
     fn target_at_entry_price_is_most_urgent() {
-        // pnl = 0% → closeness = 1.0 → MIN interval (scan every 10s)
+        // pnl = 0% -> closeness = 1.0 -> MIN interval (scan every 10s)
         let positions = [monitoring(dec!(0))];
         let interval = compute_scan_interval(&positions, MAX_LOSS);
         assert_eq!(
@@ -1164,7 +1164,7 @@ mod scan_interval_tests {
 
     #[test]
     fn target_with_small_move_is_still_urgent() {
-        // pnl = +5% → closeness = 1 - 0.05/0.15 ≈ 0.67 → ~27s
+        // pnl = +5% -> closeness = 1 - 0.05/0.15 ~ 0.67 -> ~27s
         let positions = [monitoring(dec!(0.05))];
         let interval = compute_scan_interval(&positions, MAX_LOSS);
         assert!(
@@ -1176,8 +1176,8 @@ mod scan_interval_tests {
 
     #[test]
     fn target_in_small_drawdown_still_scanned_urgently() {
-        // pnl = -5% (within allowed drawdown) → closeness = 1 - 0.05/0.15 ≈ 0.67 → ~27s
-        // We should still scan frequently — it's enterable and near the target's entry
+        // pnl = -5% (within allowed drawdown) -> closeness = 1 - 0.05/0.15 ~ 0.67 -> ~27s
+        // We should still scan frequently - it's enterable and near the target's entry
         let positions = [monitoring(dec!(-0.05))];
         let interval = compute_scan_interval(&positions, MAX_LOSS);
         assert!(
@@ -1189,16 +1189,16 @@ mod scan_interval_tests {
 
     #[test]
     fn target_far_from_entry_scans_slowly() {
-        // pnl = +15% → closeness = 0 → MAX interval, we'd be chasing
+        // pnl = +15% -> closeness = 0 -> MAX interval, we'd be chasing
         let positions = [monitoring(dec!(0.15))];
         let interval = compute_scan_interval(&positions, MAX_LOSS);
-        assert_eq!(interval, MAX_S, "price moved 15%+ from entry — no urgency");
+        assert_eq!(interval, MAX_S, "price moved 15%+ from entry - no urgency");
     }
 
     #[test]
     fn target_beyond_drawdown_is_excluded() {
-        // pnl = -11% which is below max_copy_loss_pct=10% → classify_position filters this
-        // compute_scan_interval also excludes it → MAX interval
+        // pnl = -11% which is below max_copy_loss_pct=10% -> classify_position filters this
+        // compute_scan_interval also excludes it -> MAX interval
         let positions = [monitoring(dec!(-0.11))];
         let interval = compute_scan_interval(&positions, MAX_LOSS);
         assert_eq!(
@@ -1209,7 +1209,7 @@ mod scan_interval_tests {
 
     #[test]
     fn non_monitoring_positions_are_ignored() {
-        // Entered, SkippedLoss, etc. are not candidates — should not affect interval
+        // Entered, SkippedLoss, etc. are not candidates - should not affect interval
         let positions = [
             skipped(dec!(0.0), ScanStatus::Entered), // would be urgent if counted
             skipped(dec!(-0.11), ScanStatus::SkippedLoss), // past drawdown
@@ -1224,11 +1224,11 @@ mod scan_interval_tests {
     #[test]
     fn best_opportunity_drives_urgency() {
         // Three positions: one far from entry, one at entry, one past drawdown
-        // The one at entry should dominate → MIN interval
+        // The one at entry should dominate -> MIN interval
         let positions = [
-            monitoring(dec!(0.20)),  // too far → closeness 0
-            monitoring(dec!(0.0)),   // at entry → closeness 1.0 → urgent
-            monitoring(dec!(-0.11)), // past drawdown → filtered
+            monitoring(dec!(0.20)),  // too far -> closeness 0
+            monitoring(dec!(0.0)),   // at entry -> closeness 1.0 -> urgent
+            monitoring(dec!(-0.11)), // past drawdown -> filtered
         ];
         let interval = compute_scan_interval(&positions, MAX_LOSS);
         assert_eq!(interval, MIN_S, "best opportunity should dominate");

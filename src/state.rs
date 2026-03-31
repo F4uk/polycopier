@@ -13,7 +13,7 @@ pub struct BotState {
     pub copies_executed: u32,
     pub trades_skipped: u32,
     /// Estimated total invested capital of the target wallet(s).
-    /// Computed each scan cycle as Σ(avg_price × size) across all target open positions.
+    /// Computed each scan cycle as sum((avg_price * size) across all target open positions.
     /// Used by `SizingMode::TargetPct` to compute proportional order sizes.
     pub target_portfolio_usd: Decimal,
 }

@@ -21,7 +21,7 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// ── Snapshot cloned out of the RwLock each frame ──────────────────────────────
+// -- Snapshot cloned out of the RwLock each frame ------------------------------
 struct Snap {
     balance: Decimal,
     realized_pnl: Decimal,
@@ -29,15 +29,14 @@ struct Snap {
     feed: Vec<EvaluatedTrade>,
     positions: Vec<Position>,
     target_positions: Vec<TargetPosition>,
+    target_portfolio_est: Option<Decimal>,
     copies: u32,
     skips: u32,
-    /// Only Some when sizing_mode == TargetPct; displayed in scanner header.
-    target_portfolio_est: Option<Decimal>,
 }
 
 fn shorten(addr: &str) -> String {
     if addr.len() > 13 {
-        format!("{}…{}", &addr[..6], &addr[addr.len() - 4..])
+        format!("{}..{}", &addr[..6], &addr[addr.len() - 4..])
     } else {
         addr.to_string()
     }
@@ -53,7 +52,7 @@ fn pnl_color(v: Decimal) -> Color {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -71,14 +70,14 @@ pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<(
                 feed: g.live_feed.iter().take(20).cloned().collect(),
                 positions: g.positions.values().cloned().collect(),
                 target_positions: g.target_positions.clone(),
-                copies: g.copies_executed,
-                skips: g.trades_skipped,
                 target_portfolio_est: if config.sizing_mode == crate::models::SizingMode::TargetPct
                 {
                     Some(g.target_portfolio_usd)
                 } else {
                     None
                 },
+                copies: g.copies_executed,
+                skips: g.trades_skipped,
             }
         };
 
@@ -103,11 +102,11 @@ pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<(
     Ok(())
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 fn render(f: &mut Frame, snap: &Snap, config: &Config) {
     let area = f.size();
 
-    // ── Outer vertical split: header / body / footer ──────────────────────────
+    // -- Outer vertical split: header / body / footer --------------------------
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -122,7 +121,7 @@ fn render(f: &mut Frame, snap: &Snap, config: &Config) {
     render_footer(f, outer[2]);
 }
 
-// ── Header ────────────────────────────────────────────────────────────────────
+// -- Header --------------------------------------------------------------------
 fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::layout::Rect) {
     let title_style = Style::default()
         .fg(Color::Cyan)
@@ -153,17 +152,17 @@ fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::lay
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("  ◆ POLYCOPIER ", title_style),
+            Span::styled("  [*] POLYCOPIER ", title_style),
             Span::styled(
-                "· Automated Copy Trading Engine  ",
+                "- Automated Copy Trading Engine  ",
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled("● LIVE", live_style),
+            Span::styled("* LIVE", live_style),
         ]),
         Line::from(vec![
             Span::styled("  Wallet: ", label_style),
             Span::styled(wallet_short, val_style),
-            Span::styled("   │   Target(s): ", label_style),
+            Span::styled("   |   Target(s): ", label_style),
             Span::styled(&targets_short as &str, Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
@@ -174,17 +173,17 @@ fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::lay
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("   │   Realized: ", label_style),
+            Span::styled("   |   Realized: ", label_style),
             Span::styled(
                 format!("${:.2}", snap.realized_pnl),
                 Style::default().fg(pos_pnl),
             ),
-            Span::styled("   │   Unrealized: ", label_style),
+            Span::styled("   |   Unrealized: ", label_style),
             Span::styled(
                 format!("${:.2}", snap.unrealized_pnl),
                 Style::default().fg(pnl_color(snap.unrealized_pnl)),
             ),
-            Span::styled("   │   Copied: ", label_style),
+            Span::styled("   |   Copied: ", label_style),
             Span::styled(
                 format!("{}", snap.copies),
                 Style::default()
@@ -203,12 +202,12 @@ fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::lay
                 format!("{} positions tracked", total_scanned),
                 Style::default().fg(Color::White),
             ),
-            Span::styled("   │   ", label_style),
+            Span::styled("   |   ", label_style),
             Span::styled(
                 format!("{} entry opportunities", watch_count),
                 Style::default().fg(Color::Green),
             ),
-            Span::styled("   │   refreshes every 60s", label_style),
+            Span::styled("   |   refreshes every 60s", label_style),
         ]),
     ];
 
@@ -221,7 +220,7 @@ fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::lay
     f.render_widget(header, area);
 }
 
-// ── Body: left panel + right panel ───────────────────────────────────────────
+// -- Body: left panel + right panel -------------------------------------------
 fn render_body(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -241,16 +240,16 @@ fn render_body(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     render_scanner(f, snap, cols[1]);
 }
 
-// ── Live Feed ────────────────────────────────────────────────────────────────
+// -- Live Feed ----------------------------------------------------------------
 fn render_live_feed(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     let items: Vec<ListItem> = snap
         .feed
         .iter()
         .map(|ev| {
             let (icon, style) = if ev.validated {
-                ("✔", Style::default().fg(Color::Green))
+                ("+", Style::default().fg(Color::Green))
             } else {
-                ("✘", Style::default().fg(Color::DarkGray))
+                ("-", Style::default().fg(Color::DarkGray))
             };
             let side = match ev.original_event.side {
                 TradeSide::BUY => "BUY ",
@@ -274,7 +273,7 @@ fn render_live_feed(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     let list = List::new(items).block(
         Block::default()
             .title(Span::styled(
-                " ⚡ Live Copy Feed ",
+                " [~] Live Copy Feed ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -286,7 +285,7 @@ fn render_live_feed(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     f.render_widget(list, area);
 }
 
-// ── Our Positions ─────────────────────────────────────────────────────────────
+// -- Our Positions -------------------------------------------------------------
 fn render_our_positions(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     let header = Row::new(vec![
         Cell::from("Token").style(
@@ -332,7 +331,7 @@ fn render_our_positions(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect)
     .block(
         Block::default()
             .title(Span::styled(
-                format!(" 💼 Our Positions ({}) ", snap.positions.len()),
+                format!(" [P] Our Positions ({}) ", snap.positions.len()),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -344,7 +343,7 @@ fn render_our_positions(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect)
     f.render_widget(table, area);
 }
 
-// ── Opportunity Scanner ───────────────────────────────────────────────────────
+// -- Opportunity Scanner -------------------------------------------------------
 fn render_scanner(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     let header = Row::new(vec![
         Cell::from("STATUS").style(
@@ -384,7 +383,7 @@ fn render_scanner(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
             let pnl_str = format!("{:+.1}%", pnl_pct);
             let market = format!("{} ({})", pos.title, pos.outcome);
             let market_trunc = if market.len() > 44 {
-                format!("{}…", &market[..44])
+                format!("{}...", &market[..44])
             } else {
                 market.clone()
             };
@@ -410,13 +409,13 @@ fn render_scanner(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
 
     let title = if let Some(portfolio) = snap.target_portfolio_est {
         format!(
-            " {} Opportunity Scanner  — {} watching / {} tracked | Est. target portfolio: ${:.0} ",
-            '\u{1F50E}', watch, total, portfolio
+            " [S] Opportunity Scanner  -- {} watching / {} tracked | Est. target portfolio: ${:.0} ",
+            watch, total, portfolio
         )
     } else {
         format!(
-            " {} Opportunity Scanner  — {} watching / {} tracked ",
-            '\u{1F50E}', watch, total
+            " [S] Opportunity Scanner  -- {} watching / {} tracked ",
+            watch, total
         )
     };
 
@@ -446,7 +445,7 @@ fn render_scanner(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     f.render_widget(table, area);
 }
 
-// ── Footer ────────────────────────────────────────────────────────────────────
+// -- Footer --------------------------------------------------------------------
 fn render_footer(f: &mut Frame, area: ratatui::layout::Rect) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("  [q] Quit", Style::default().fg(Color::Red)),
@@ -455,7 +454,7 @@ fn render_footer(f: &mut Frame, area: ratatui::layout::Rect) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
-            "                         POLYCOPIER v0.1 — Powered by Polymarket SDK",
+            "                         POLYCOPIER v0.1 - Powered by Polymarket SDK",
             Style::default().fg(Color::DarkGray),
         ),
     ]))

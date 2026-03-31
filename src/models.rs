@@ -3,22 +3,22 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// Controls how order sizes are computed for each copied trade.
-/// Set via the `SIZING_MODE` env var. Mutually exclusive — only one is active at a time.
+/// Set via the `SIZING_MODE` env var. Mutually exclusive -- only one is active at a time.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum SizingMode {
     /// Always spend exactly `MAX_TRADE_SIZE_USD` per trade.
     #[default]
     Fixed,
-    /// Spend `COPY_SIZE_PCT` × our current balance (floored at CLOB $5 minimum,
+    /// Spend `COPY_SIZE_PCT` * our current balance (floored at CLOB $5 minimum,
     /// capped at `MAX_TRADE_SIZE_USD`).
     SelfPct,
-    /// Mirror the target's exact dollar notional (`event.size × event.price`),
+    /// Mirror the target's exact dollar notional (`event.size * event.price`),
     /// capped at `MAX_TRADE_SIZE_USD`.
     TargetUsd,
     /// Scale the target's portfolio proportion to our wallet:
-    /// `(target_notional / target_portfolio_est) × our_balance`,
+    /// `(target_notional / target_portfolio_est) * our_balance`,
     /// floored at $5, capped at `MAX_TRADE_SIZE_USD`.
-    /// `target_portfolio_est` is approximated as Σ(avg_price × size) of the target's
+    /// `target_portfolio_est` is approximated as sum((avg_price * size) of the target's
     /// open positions, refreshed each scan cycle.
     TargetPct,
 }
@@ -83,7 +83,7 @@ pub struct OrderRequest {
     pub side: TradeSide,
 }
 
-// ── Opportunity Scanner types ─────────────────────────────────────────────────
+// -- Opportunity Scanner types -------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanStatus {
@@ -97,11 +97,11 @@ pub enum ScanStatus {
 impl ScanStatus {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Monitoring => "◉ WATCH",
-            Self::Entered => "⏺ QUEUED",
-            Self::SkippedOwned => "◆ HELD",
-            Self::SkippedLoss => "✘ LOSS",
-            Self::SkippedPrice => "─ RANGE",
+            Self::Monitoring => "[W] WATCH",
+            Self::Entered => "[Q] QUEUED",
+            Self::SkippedOwned => "[H] HELD",
+            Self::SkippedLoss => "[X] LOSS",
+            Self::SkippedPrice => "[-] RANGE",
         }
     }
     pub fn color(&self) -> Color {

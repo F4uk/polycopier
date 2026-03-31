@@ -9,11 +9,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
-// ── Pure helpers (extracted for testability) ──────────────────────────────────
+// -- Pure helpers (extracted for testability) ----------------------------------
 
 /// Applies slippage to a price to produce the limit order price.
 pub fn calculate_limit_price(price: Decimal, side: TradeSide, slippage_pct: Decimal) -> Decimal {
-    // Polymarket CLOB tick size is 0.001 — prices must have at most 3 decimal places.
+    // Polymarket CLOB tick size is 0.001 -- prices must have at most 3 decimal places.
     // Token prices are also bounded [0.001, 0.999] for an open binary market.
     let max_price = Decimal::new(999, 3); // 0.999
     let min_price = Decimal::new(1, 3); // 0.001
@@ -33,7 +33,7 @@ pub fn calculate_entry_size(size: Decimal, price: Decimal, max_trade_usd: Decima
     }
 }
 
-/// Minimum notional the CLOB requires (5 shares × ~$1.00 = $5.00).
+/// Minimum notional the CLOB requires (5 shares * ~$1.00 = $5.00).
 pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 
 /// Compute the USD budget for a single BUY order according to the active [`SizingMode`].
@@ -41,9 +41,9 @@ pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 /// | Mode | Formula |
 /// |---|---|
 /// | `Fixed` | `max_trade_usd` (constant) |
-/// | `SelfPct` | `our_balance × copy_size_pct`, floored at `$5`, capped at `max_trade_usd` |
+/// | `SelfPct` | `our_balance * copy_size_pct`, floored at `$5`, capped at `max_trade_usd` |
 /// | `TargetUsd` | `target_notional` (exact $ the target bet), capped at `max_trade_usd` |
-/// | `TargetPct` | `(target_notional / target_portfolio_usd) × our_balance`, floored at `$5`, capped at `max_trade_usd` |
+/// | `TargetPct` | `(target_notional / target_portfolio_usd) * our_balance`, floored at `$5`, capped at `max_trade_usd` |
 ///
 /// Guards:
 /// - All modes are floored at `MIN_ORDER_USD` ($5.00) and capped at `max_trade_usd`.
@@ -66,7 +66,7 @@ pub fn compute_order_usd(
         SizingMode::TargetUsd => target_notional,
         SizingMode::TargetPct => {
             if target_portfolio_usd <= Decimal::ZERO {
-                // No portfolio data yet — fall back gracefully to fixed size
+                // No portfolio data yet -- fall back gracefully to fixed size
                 max_trade_usd
             } else {
                 let proportion = target_notional / target_portfolio_usd;
@@ -137,7 +137,7 @@ pub fn start_strategy_engine(
                 }
             }
 
-            // ── Intent classification using target's scanner positions ──────────
+            // -- Intent classification using target's scanner positions ----------
             // The position scanner refreshes target_positions every 60 seconds.
             // We use it to distinguish fresh entries from closures, and to detect
             // short positions (SELL to open, BUY to close) that we cannot replicate.
@@ -153,7 +153,7 @@ pub fn start_strategy_engine(
                 };
 
                 // Only apply intent classification when scanner has populated data.
-                // If target_positions is empty the scanner hasn't run yet — fall back
+                // If target_positions is empty the scanner hasn't run yet -- fall back
                 // to side-based logic (safe: SELLs still require us to hold the token).
                 let scanner_ready = {
                     let guard = state.read().await;
@@ -164,26 +164,26 @@ pub fn start_strategy_engine(
                     match event.side {
                         TradeSide::BUY => {
                             if !target_holds && we_hold {
-                                // We're already long, target has no position →
+                                // We're already long, target has no position ->
                                 // target is likely closing a short we never entered.
                                 Some("BUY skipped: we hold long but target has no position (short close)")
                             } else {
-                                None // Fresh long entry or adding to long → copy
+                                None // Fresh long entry or adding to long -> copy
                             }
                         }
                         TradeSide::SELL => {
                             if target_holds && we_hold {
-                                None // Target closing their long, we hold → copy
+                                None // Target closing their long, we hold -> copy
                             } else if target_holds && !we_hold {
                                 Some("SELL skipped: target closing long we never entered")
                             } else {
-                                // !target_holds → target opening a short (no prior long position)
+                                // !target_holds -> target opening a short (no prior long position)
                                 Some("SELL skipped: target opening short position (not supported)")
                             }
                         }
                     }
                 } else {
-                    // Scanner not yet populated — fall back to: only skip SELLs we don't hold
+                    // Scanner not yet populated -- fall back to: only skip SELLs we don't hold
                     if event.side == TradeSide::SELL && !we_hold {
                         Some("SELL skipped: position not held (scanner warming up)")
                     } else {
@@ -214,8 +214,8 @@ pub fn start_strategy_engine(
                     calculate_limit_price(event.price, event.side, config.max_slippage_pct);
 
                 let order = if is_closing {
-                    // ── SELL: close our position using our held size (not the target's size) ──
-                    let fee_factor = Decimal::new(97, 2); // 0.97 — CLOB fee buffer for SELLs
+                    // -- SELL: close our position using our held size (not the target's size) --
+                    let fee_factor = Decimal::new(97, 2); // 0.97 -- CLOB fee buffer for SELLs
                     let our_held_size = {
                         let guard = state.read().await;
                         guard
@@ -232,7 +232,7 @@ pub fn start_strategy_engine(
                         side: event.side,
                     })
                 } else {
-                    // ── BUY: size according to active SizingMode, capped and $5 floored ──
+                    // -- BUY: size according to active SizingMode, capped and $5 floored --
                     let (current_balance, target_portfolio_usd) = {
                         let guard = state.read().await;
                         (guard.total_balance, guard.target_portfolio_usd)
@@ -254,11 +254,11 @@ pub fn start_strategy_engine(
                     };
                     let buy_size = raw_size.round_dp(2); // CLOB requires 2dp lot size
 
-                    // Pre-check balance — avoids noisy 400 errors from CLOB
+                    // Pre-check balance -- avoids noisy 400 errors from CLOB
                     let order_cost = buy_size * limit_price;
                     if current_balance < order_cost {
                         warn!(
-                            "Insufficient balance (have ${:.2}, need ${:.2}) — skipping entry",
+                            "Insufficient balance (have ${:.2}, need ${:.2}) -- skipping entry",
                             current_balance, order_cost
                         );
                         None
@@ -287,7 +287,7 @@ pub fn start_strategy_engine(
     });
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,14 +311,14 @@ mod tests {
 
     #[test]
     fn entry_size_within_budget_unchanged() {
-        // 10 shares at $0.40 = $4 — under $10 max
+        // 10 shares at $0.40 = $4 -- under $10 max
         let result = calculate_entry_size(dec!(10), dec!(0.40), dec!(10));
         assert_eq!(result, dec!(10));
     }
 
     #[test]
     fn entry_size_capped_to_max_usd() {
-        // 100 shares at $0.40 = $40 — over $10 max => 10/0.40 = 25 shares
+        // 100 shares at $0.40 = $40 -- over $10 max => 10/0.40 = 25 shares
         let result = calculate_entry_size(dec!(100), dec!(0.40), dec!(10));
         assert_eq!(result, dec!(25));
     }

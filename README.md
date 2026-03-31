@@ -24,16 +24,16 @@ their trades into your own account in real time.
 
 **Two independent signal sources feed the same execution engine:**
 
-1. **Real-time listener** — polls the Data API every 2 seconds and copies new fills the
+1. **Real-time listener** - polls the Data API every 2 seconds and copies new fills the
    moment they appear, using transaction-hash deduplication to handle burst activity.
 
-2. **Adaptive position scanner** — scans the target's full open-position portfolio and
+2. **Adaptive position scanner** - scans the target's full open-position portfolio and
    evaluates catch-up entries (positions the target had open before the bot started).
    Scan frequency adapts dynamically between 10 and 60 seconds based on how close each
-   target position's current price is to their original entry — scanning most aggressively
+   target position's current price is to their original entry - scanning most aggressively
    when a catch-up entry is still at a favorable price.
 
-**Trade intent classification** — the bot tracks the target's current positions (via the
+**Trade intent classification** - the bot tracks the target's current positions (via the
 scanner data) and uses them to classify every event before acting:
 
 | Target has position? | Event | Bot has position? | Intent | Action |
@@ -54,15 +54,15 @@ The entire interface is a terminal UI (TUI) with no browser required.
 
 ## Features
 
-- **Real-time trade copying** — polls the Polymarket Data API every 2 seconds with a
+- **Real-time trade copying** - polls the Polymarket Data API every 2 seconds with a
   rate limit of 20 fills per cycle. Deduplicates by transaction hash (not timestamp) so
   burst activity is never silently dropped.
 
-- **Adaptive open-position scanner** — catches positions the target opened before the bot
+- **Adaptive open-position scanner** - catches positions the target opened before the bot
   started. Scan interval scales from 10s (target position still at entry price) to 60s
   (price has moved significantly or no enterable positions exist).
 
-- **Intent classification** — every incoming BUY and SELL is checked against the target's
+- **Intent classification** - every incoming BUY and SELL is checked against the target's
   last-known positions to determine true intent (fresh entry, adding to long, closing long,
   closing short). Short entries and short closures by the target are correctly skipped.
 
@@ -71,24 +71,23 @@ The entire interface is a terminal UI (TUI) with no browser required.
   - SELL quantities are based on **our own held size**, not the target's order size.
   - SELL is never submitted for a token we don't hold.
 
-- **Proportional position sizing** (`COPY_SIZE_PCT`) — sizes each trade as a percentage of
-  your current balance (e.g. `0.10` = 10%), clamped between the CLOB's $5 minimum lot and
-  `MAX_TRADE_SIZE_USD` as a hard cap. Auto-scales as your wallet grows without any config change.
+- **BUY floor** - entry size targets a minimum of $1.10 notional to prevent rounding errors
+  from dropping below the CLOB's $1.00 minimum order size.
 
-- **Interactive setup wizard** — prompts for all credentials on first run and saves to `.env`.
+- **Interactive setup wizard** - prompts for all credentials on first run and saves to `.env`.
 
-- **Live balance tracking** — CLOB balance polled every 10 seconds.
+- **Live balance tracking** - CLOB balance polled every 10 seconds.
 
-- **Risk engine** — per-trade minimum notional ($1.00), per-trade size cap, and
+- **Risk engine** - per-trade minimum notional ($1.00), per-trade size cap, and
   per-position drawdown filter (`MAX_COPY_LOSS_PCT`).
 
-- **Terminal UI** — four-panel ratatui interface:
+- **Terminal UI** - four-panel ratatui interface:
   - Account dashboard (balance, PnL, copy stats)
   - Live copy feed (pass/fail, skip reason per event)
   - Your open positions
   - Opportunity scanner table (color-coded by status)
 
-- **Pre-commit quality gates** — `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
+- **Pre-commit quality gates** - `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
   run automatically before every commit via `.githooks/pre-commit`.
 
 ---
@@ -131,33 +130,17 @@ cargo run --release
 
 ### Environment Variables
 
-| Variable | Required | Default | Wizard | Description |
-|---|---|---|---|---|
-| `PRIVATE_KEY` | Yes | — | ✅ | Hex private key for the signing wallet (`0x…` or plain hex) |
-| `FUNDER_ADDRESS` | Yes | — | ✅ | Proxy/Safe wallet address that holds USDC (shown on your Polymarket profile) |
-| `TARGET_WALLETS` | Yes | — | ✅ | Comma-separated list of target proxy wallet addresses to copy |
-| `MAX_SLIPPAGE_PCT` | No | `0.02` | ✅ | Maximum allowed price deviation from the copied trade (2% = `0.02`) |
-| `MAX_TRADE_SIZE_USD` | No | `50.00` | ✅ | Hard ceiling: maximum USDC per trade, regardless of sizing mode |
-| `MAX_DELAY_SECONDS` | No | `10` | ✅ | Discard live trade events older than this many seconds |
-| `MAX_COPY_LOSS_PCT` | No | `0.20` | ✅ | Skip catch-up entries where the target is already this far underwater |
-| `SIZING_MODE` | No | `target_pct` | ✅ | **Trade sizing strategy** (see table below). One of: `fixed`, `self_pct`, `target_usd`, `target_pct` |
-| `COPY_SIZE_PCT` | No | — | ✅* | Fraction of YOUR balance per trade. *Only prompted when `SIZING_MODE=self_pct` |
-| `MIN_ENTRY_PRICE` | No | `0.02` | — | Minimum token price for catch-up entries (filters near-zero dust) |
-| `MAX_ENTRY_PRICE` | No | `0.999` | — | Maximum token price for catch-up entries |
-
-### Sizing Modes
-
-All modes floor at $5.00 (CLOB minimum lot) and cap at `MAX_TRADE_SIZE_USD`.
-
-| `SIZING_MODE` | Formula | Best for |
-|---|---|---|
-| `fixed` | Always `MAX_TRADE_SIZE_USD` | Simple fixed-size testing |
-| `self_pct` | `our_balance × COPY_SIZE_PCT` | Scaling with our own wallet size |
-| `target_usd` | `event.size × event.price` (the target's exact $ bet) | Mirroring dollar amounts |
-| `target_pct` ⭐ | `(target_notional / target_portfolio_est) × our_balance` | Mirroring risk proportions |
-
-`target_pct` uses an approximation of the target's portfolio (`Σ avg_price × size` across open positions, refreshed each scan cycle). When active, the TUI scanner panel displays `Est. target portfolio: $X,XXX` so you can validate the estimate.
-
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `PRIVATE_KEY` | Yes | - | Hex private key for the signing wallet (`0x...` or plain hex) |
+| `FUNDER_ADDRESS` | Yes | - | Proxy/Safe wallet address that holds USDC (shown on your Polymarket profile) |
+| `TARGET_WALLETS` | Yes | - | Comma-separated list of target proxy wallet addresses to copy |
+| `MAX_SLIPPAGE_PCT` | No | `0.02` | Maximum allowed price deviation from the copied trade (2% = `0.02`) |
+| `MAX_TRADE_SIZE_USD` | No | `10.00` | Maximum USDC to spend per copied trade |
+| `MAX_DELAY_SECONDS` | No | `10` | Discard live trade events (listener) older than this many seconds |
+| `MAX_COPY_LOSS_PCT` | No | `0.40` | Skip catch-up entries where the target is already this far underwater (40% = `0.40`) |
+| `MIN_ENTRY_PRICE` | No | `0.02` | Minimum token price accepted for catch-up entries (filters near-zero dust) |
+| `MAX_ENTRY_PRICE` | No | `0.998` | Maximum token price accepted for catch-up entries. Raise above `0.95` when copying targets who trade high-confidence NO positions (e.g. `0.998`) |
 
 ### Wallet Type
 
@@ -184,8 +167,7 @@ On first run with an empty or placeholder `.env`, the setup wizard prompts for:
 1. Private key (hidden input)
 2. Funder address
 3. Target wallet addresses
-4. Max slippage, trade size cap, delay, and drawdown loss threshold
-5. Proportional trade size (`COPY_SIZE_PCT`) — press Enter to accept `0.10` (10% of balance)
+4. Slippage, trade size, delay, and loss-threshold limits
 
 All values are saved to `.env` and reused on subsequent runs.
 
@@ -217,7 +199,7 @@ main.rs
   |
   +-- listener.rs        Data API polling loop (2s, hash-dedup) -> TradeEvent channel
   |
-  +-- position_scanner.rs  Catch-up scanner (adaptive 10–60s) -> TradeEvent channel
+  +-- position_scanner.rs  Catch-up scanner (adaptive 10-60s) -> TradeEvent channel
   |
   +-- strategy.rs        Receives TradeEvents, classifies intent, applies risk checks,
   |                       submits orders via OrderSubmitter
@@ -240,7 +222,7 @@ Polymarket Data API
     |
     +-- listener (2s poll, limit 20, hash-dedup) -----> mpsc::Sender<TradeEvent>
     |                                                              |
-    +-- position_scanner (adaptive 10–60s poll) -----> mpsc::Sender<TradeEvent> (cloned)
+    +-- position_scanner (adaptive 10-60s poll) -----> mpsc::Sender<TradeEvent> (cloned)
                                                                    |
                                                          strategy engine
                                                            - wallet filter
@@ -260,10 +242,10 @@ Polymarket Data API
 The scanner fetches the target's full open portfolio and evaluates each position in order.
 A position is skipped at the first failing guard:
 
-1. **Already held** — the bot already holds this token (`SkippedOwned`)
-2. **Already queued** — an entry order was sent this session (`Entered`)
-3. **Price range** — current price must be between `$0.02` and `$0.95` (`SkippedPrice`)
-4. **Loss threshold** — the target's unrealized loss must be less than `MAX_COPY_LOSS_PCT` (`SkippedLoss`)
+1. **Already held** - the bot already holds this token (`SkippedOwned`)
+2. **Already queued** - an entry order was sent this session (`Entered`)
+3. **Price range** - current price must be between `$0.02` and `$0.95` (`SkippedPrice`)
+4. **Loss threshold** - the target's unrealized loss must be less than `MAX_COPY_LOSS_PCT` (`SkippedLoss`)
 
 Positions passing all guards are classified as `Monitoring` (green in TUI) and an entry is queued.
 
@@ -274,9 +256,9 @@ The scanner reschedules itself after each cycle based on the best available oppo
 | Target position state | Scan interval |
 |---|---|
 | Price exactly at target's entry (0% PnL) | 10s |
-| Small move (±5%) | ~27s |
-| Moderate move (±10%) | ~43s |
-| Large move (±15%+) — would be chasing | 60s |
+| Small move (+/-5%) | ~27s |
+| Moderate move (+/-10%) | ~43s |
+| Large move (+/-15%+) - would be chasing | 60s |
 | No enterable (Monitoring) positions | 60s |
 | Position past `MAX_COPY_LOSS_PCT` | 60s (filtered out) |
 
@@ -288,7 +270,7 @@ The scanner reschedules itself after each cycle based on the best available oppo
 # Run with live reloading (requires cargo-watch)
 cargo watch -x run
 
-# Run the full test suite (82 tests, all pure/unit — no network)
+# Run the full test suite (82 tests, all pure/unit - no network)
 cargo test --all
 
 # Lint
@@ -309,7 +291,7 @@ git config core.hooksPath .githooks
 ## Security Notes
 
 - Your private key is used locally to sign EIP-712 order hashes. It is never transmitted
-  to any server — only the resulting signature is sent to the CLOB API.
+  to any server - only the resulting signature is sent to the CLOB API.
 - The `.env` file is excluded from version control by `.gitignore`. Treat it like a password.
 - Review `src/risk.rs` and configure appropriate limits before running with significant capital.
 - This software is provided as-is. You are solely responsible for any trades it executes.

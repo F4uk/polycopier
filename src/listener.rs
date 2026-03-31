@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 /// How many recent tx hashes to remember for deduplication.
-/// At 20 trades/poll × 1 poll/2s, 500 covers ~50 seconds of burst.
+/// At 20 trades/poll x 1 poll/2s, 500 covers ~50 seconds of burst.
 const SEEN_HASHES_CAP: usize = 500;
 
 pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) -> Result<()> {
@@ -22,7 +22,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
         info!("Started tracking third-party targets: {:?}", targets);
 
         // Deduplicate by transaction hash instead of a timestamp watermark.
-        // Timestamps are coarse (seconds) and drop burst trades — hashes are exact.
+        // Timestamps are coarse (seconds) and drop burst trades - hashes are exact.
         let mut seen_hashes: HashSet<String> = HashSet::new();
         let mut seen_order: VecDeque<String> = VecDeque::new();
 
@@ -35,7 +35,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                     Err(_) => continue,
                 };
 
-                // Fetch the last 20 trades (was 5 — raised to survive burst activity)
+                // Fetch the last 20 trades (was 5 - raised to survive burst activity)
                 let req = match TradesRequest::builder()
                     .user(target_addr)
                     .limit(20)

@@ -1,4 +1,4 @@
-//! Tests for `compute_order_usd` — all four SizingMode variants.
+//! Tests for `compute_order_usd` -- all four SizingMode variants.
 //!
 //! Covers: Fixed, SelfPct, TargetUsd, TargetPct, floor/cap guards,
 //! zero-portfolio fallback, misconfigured max < min.
@@ -9,9 +9,9 @@ use polycopier::models::SizingMode;
 use polycopier::strategy::{compute_order_usd, MIN_ORDER_USD};
 use rust_decimal_macros::dec;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- Helpers ------------------------------------------------------------------
 
-/// Convenience wrapper — mirrors the full signature with named fields.
+/// Convenience wrapper -- mirrors the full signature with named fields.
 fn size(
     our_balance: impl Into<rust_decimal::Decimal>,
     sizing_mode: &SizingMode,
@@ -30,7 +30,7 @@ fn size(
     )
 }
 
-// ── SizingMode::Fixed ─────────────────────────────────────────────────────────
+// -- SizingMode::Fixed ---------------------------------------------------------
 
 #[test]
 fn fixed_always_returns_max() {
@@ -80,7 +80,7 @@ fn fixed_with_no_copy_size_pct_still_returns_max() {
     assert_eq!(usd, dec!(25));
 }
 
-// ── SizingMode::SelfPct ───────────────────────────────────────────────────────
+// -- SizingMode::SelfPct -------------------------------------------------------
 
 #[test]
 fn self_pct_uses_fraction_of_balance() {
@@ -140,7 +140,7 @@ fn self_pct_at_exact_cap_boundary() {
 
 #[test]
 fn self_pct_with_no_copy_size_pct_falls_back_to_max() {
-    // No pct provided — should produce max_trade_usd (balance/balance = 1, clamped)
+    // No pct provided -- should produce max_trade_usd (balance/balance = 1, clamped)
     // Actual fallback: pct = max/balance = 10/200 = 0.05 => 200*0.05 = 10 = max
     let usd = size(
         dec!(200),
@@ -153,7 +153,7 @@ fn self_pct_with_no_copy_size_pct_falls_back_to_max() {
     assert_eq!(usd, dec!(10));
 }
 
-// ── SizingMode::TargetUsd ────────────────────────────────────────────────────
+// -- SizingMode::TargetUsd ----------------------------------------------------
 
 #[test]
 fn target_usd_mirrors_target_notional() {
@@ -185,7 +185,7 @@ fn target_usd_capped_at_max() {
 
 #[test]
 fn target_usd_floored_at_clob_minimum() {
-    // Target bet $1 — below CLOB minimum, floor to $5
+    // Target bet $1 -- below CLOB minimum, floor to $5
     let usd = size(
         dec!(500),
         &SizingMode::TargetUsd,
@@ -234,11 +234,11 @@ fn target_usd_ignores_our_balance() {
     assert_eq!(small, dec!(30));
 }
 
-// ── SizingMode::TargetPct ────────────────────────────────────────────────────
+// -- SizingMode::TargetPct ----------------------------------------------------
 
 #[test]
 fn target_pct_scales_proportion_to_our_balance() {
-    // Target bet $10 / $1000 portfolio = 1% → we have $200 → 1% = $2 → floor to $5
+    // Target bet $10 / $1000 portfolio = 1% -> we have $200 -> 1% = $2 -> floor to $5
     let usd = size(
         dec!(200),
         &SizingMode::TargetPct,
@@ -252,7 +252,7 @@ fn target_pct_scales_proportion_to_our_balance() {
 
 #[test]
 fn target_pct_larger_proportion() {
-    // Target bet $100 / $1000 = 10% → we have $500 → 10% = $50 = cap
+    // Target bet $100 / $1000 = 10% -> we have $500 -> 10% = $50 = cap
     let usd = size(
         dec!(500),
         &SizingMode::TargetPct,
@@ -266,7 +266,7 @@ fn target_pct_larger_proportion() {
 
 #[test]
 fn target_pct_medium_case() {
-    // Target bet $50 / $500 portfolio = 10% → we have $300 → 10% = $30
+    // Target bet $50 / $500 portfolio = 10% -> we have $300 -> 10% = $30
     let usd = size(
         dec!(300),
         &SizingMode::TargetPct,
@@ -280,7 +280,7 @@ fn target_pct_medium_case() {
 
 #[test]
 fn target_pct_falls_back_to_fixed_when_portfolio_is_zero() {
-    // No scan data yet — target_portfolio_usd = 0 → graceful fallback to max_trade_usd
+    // No scan data yet -- target_portfolio_usd = 0 -> graceful fallback to max_trade_usd
     let usd = size(
         dec!(200),
         &SizingMode::TargetPct,
@@ -294,7 +294,7 @@ fn target_pct_falls_back_to_fixed_when_portfolio_is_zero() {
 
 #[test]
 fn target_pct_capped_at_max() {
-    // 50% of huge portfolio → proportion > max → cap
+    // 50% of huge portfolio -> proportion > max -> cap
     let usd = size(
         dec!(500),
         &SizingMode::TargetPct,
@@ -308,7 +308,7 @@ fn target_pct_capped_at_max() {
 
 #[test]
 fn target_pct_very_small_portfolio_produces_large_proportion() {
-    // Target has tiny $10 portfolio, bet $9 = 90% → we have $100 → 90% = $90, but cap = $50
+    // Target has tiny $10 portfolio, bet $9 = 90% -> we have $100 -> 90% = $90, but cap = $50
     let usd = size(
         dec!(100),
         &SizingMode::TargetPct,
@@ -320,7 +320,7 @@ fn target_pct_very_small_portfolio_produces_large_proportion() {
     assert_eq!(usd, dec!(50));
 }
 
-// ── Floor/ceiling edge cases (mode-agnostic) ─────────────────────────────────
+// -- Floor/ceiling edge cases (mode-agnostic) ---------------------------------
 
 #[test]
 fn max_less_than_min_clob_floor_uses_max_as_ceiling() {
@@ -339,7 +339,7 @@ fn max_less_than_min_clob_floor_uses_max_as_ceiling() {
 
 #[test]
 fn self_pct_misconfigured_max_uses_max_as_floor() {
-    // 50% of $10 = $5 — equal to cap at $5 (max < CLOB min)
+    // 50% of $10 = $5 -- equal to cap at $5 (max < CLOB min)
     let usd = size(
         dec!(10),
         &SizingMode::SelfPct,
