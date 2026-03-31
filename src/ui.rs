@@ -30,7 +30,9 @@ struct Snap {
     positions: Vec<Position>,
     target_positions: Vec<TargetPosition>,
     target_portfolio_est: Option<Decimal>,
-    copies: u32,
+    /// Positions WE hold that the target ALSO holds right now.
+    /// Cross-referenced from both position maps -- accurate across restarts.
+    copied_count: usize,
     skips: u32,
 }
 
@@ -76,7 +78,20 @@ pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<(
                 } else {
                     None
                 },
-                copies: g.copies_executed,
+                // Cross-reference: our positions whose token_id also appears
+                // in the target's current position list. Accurate after every
+                // scan cycle — regardless of restarts or session history.
+                copied_count: {
+                    let target_token_ids: std::collections::HashSet<&str> = g
+                        .target_positions
+                        .iter()
+                        .map(|p| p.token_id.as_str())
+                        .collect();
+                    g.positions
+                        .keys()
+                        .filter(|id| target_token_ids.contains(id.as_str()))
+                        .count()
+                },
                 skips: g.trades_skipped,
             }
         };
@@ -183,9 +198,9 @@ fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::lay
                 format!("${:.2}", snap.unrealized_pnl),
                 Style::default().fg(pnl_color(snap.unrealized_pnl)),
             ),
-            Span::styled("   |   Copied: ", label_style),
+            Span::styled("   |   Open: ", label_style),
             Span::styled(
-                format!("{}", snap.copies),
+                format!("{}", snap.copied_count),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
