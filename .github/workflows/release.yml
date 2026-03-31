@@ -96,10 +96,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact: polycopier-macos-arm64
 
-          - os: macos-13          # Intel Mac
-            target: x86_64-apple-darwin
-            artifact: polycopier-macos-x86_64
-
           - os: ubuntu-latest     # Linux x86_64
             target: x86_64-unknown-linux-gnu
             artifact: polycopier-linux-x86_64
@@ -171,5 +167,4 @@ jobs:
           prerelease: ${{ contains(needs.version.outputs.tag, '-') }}
           files: |
             artifacts/polycopier-macos-arm64
-            artifacts/polycopier-macos-x86_64
             artifacts/polycopier-linux-x86_64
