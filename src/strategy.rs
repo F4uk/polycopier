@@ -13,13 +13,15 @@ use tracing::{debug, info, warn};
 
 /// Applies slippage to a price to produce the limit order price.
 pub fn calculate_limit_price(price: Decimal, side: TradeSide, slippage_pct: Decimal) -> Decimal {
-    // Polymarket CLOB tick size is 0.001 -- prices must have at most 3 decimal places.
-    // Token prices are also bounded [0.001, 0.999] for an open binary market.
-    let max_price = Decimal::new(999, 3); // 0.999
-    let min_price = Decimal::new(1, 3); // 0.001
+    // Most Polymarket markets use tick size 0.01 (2 decimal places).
+    // A small number of high-liquidity markets use 0.001 (3 dp).
+    // Rounding to 2 dp works for all markets: the CLOB accepts 2 dp
+    // even when tick size is 0.001, but rejects 3 dp on 0.01-tick markets.
+    let max_price = Decimal::new(99, 2); // 0.99
+    let min_price = Decimal::new(1, 2); // 0.01
     match side {
-        TradeSide::BUY => (price + price * slippage_pct).round_dp(3).min(max_price),
-        TradeSide::SELL => (price - price * slippage_pct).round_dp(3).max(min_price),
+        TradeSide::BUY => (price + price * slippage_pct).round_dp(2).min(max_price),
+        TradeSide::SELL => (price - price * slippage_pct).round_dp(2).max(min_price),
     }
 }
 

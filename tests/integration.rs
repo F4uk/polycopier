@@ -457,10 +457,10 @@ mod strategy_tests {
 
     #[test]
     fn slippage_applied_to_high_price() {
-        // $0.90 + 2% = $0.918
+        // $0.90 + 2% = $0.918, rounded to 2dp = $0.92
         assert_eq!(
             calculate_limit_price(dec!(0.90), TradeSide::BUY, dec!(0.02)),
-            dec!(0.918)
+            dec!(0.92)
         );
     }
 
@@ -865,7 +865,7 @@ mod strategy_engine_tests {
 
         let orders = log.lock().unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].price, dec!(0.588));
+        assert_eq!(orders[0].price, dec!(0.59)); // 0.60 - 2% = 0.588, rounded to 2dp = 0.59
         assert_eq!(orders[0].side, TradeSide::SELL);
     }
 
