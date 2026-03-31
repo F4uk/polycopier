@@ -13,9 +13,13 @@ use tracing::{debug, info, warn};
 
 /// Applies slippage to a price to produce the limit order price.
 pub fn calculate_limit_price(price: Decimal, side: TradeSide, slippage_pct: Decimal) -> Decimal {
+    // Polymarket CLOB tick size is 0.001 — prices must have at most 3 decimal places.
+    // Token prices are also bounded [0.001, 0.999] for an open binary market.
+    let max_price = Decimal::new(999, 3); // 0.999
+    let min_price = Decimal::new(1, 3); // 0.001
     match side {
-        TradeSide::BUY => price + (price * slippage_pct),
-        TradeSide::SELL => price - (price * slippage_pct),
+        TradeSide::BUY => (price + price * slippage_pct).round_dp(3).min(max_price),
+        TradeSide::SELL => (price - price * slippage_pct).round_dp(3).max(min_price),
     }
 }
 
@@ -159,12 +163,9 @@ pub fn start_strategy_engine(
 
                 let is_closing = event.side == TradeSide::SELL;
 
-                // Determine limit price with slippage
-                let limit_price = if event.side == TradeSide::BUY {
-                    event.price + (event.price * config.max_slippage_pct)
-                } else {
-                    event.price - (event.price * config.max_slippage_pct)
-                };
+                // Determine limit price: rounded to 3dp (CLOB tick), capped to [0.001, 0.999]
+                let limit_price =
+                    calculate_limit_price(event.price, event.side, config.max_slippage_pct);
 
                 let actual_size = if is_closing {
                     // Position existence was already verified above — our_held_size > 0 guaranteed.
@@ -179,13 +180,15 @@ pub fn start_strategy_engine(
                     };
                     (our_held_size * fee_factor).round_dp(2)
                 } else {
-                    // BUY: cap to max_trade_size_usd
+                    // BUY: cap to max_trade_size_usd, then round to 2dp (CLOB lot size)
                     let size_cost = event.size * event.price;
-                    if size_cost > config.max_trade_size_usd {
+                    let raw_size = if size_cost > config.max_trade_size_usd {
                         config.max_trade_size_usd / event.price
                     } else {
                         event.size
-                    }
+                    };
+                    // CLOB requires sizes rounded to 2 decimal places
+                    raw_size.round_dp(2)
                 };
 
                 let order = OrderRequest {
@@ -195,12 +198,25 @@ pub fn start_strategy_engine(
                     side: event.side,
                 };
 
-                let submitter_clone = submitter.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = submitter_clone(order).await {
-                        tracing::error!("Execution failed: {}", e);
-                    }
-                });
+                // Pre-check balance before submitting — avoids noisy 400 errors from CLOB
+                let order_cost = actual_size * limit_price;
+                let current_balance = {
+                    let guard = state.read().await;
+                    guard.total_balance
+                };
+                if event.side == TradeSide::BUY && current_balance < order_cost {
+                    warn!(
+                        "Insufficient balance (have ${:.2}, need ${:.2}) — skipping entry",
+                        current_balance, order_cost
+                    );
+                } else {
+                    let submitter_clone = submitter.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = submitter_clone(order).await {
+                            tracing::error!("Execution failed: {}", e);
+                        }
+                    });
+                }
             } else {
                 warn!("Skipped trade: {}", eval.reason.unwrap_or_default());
             }

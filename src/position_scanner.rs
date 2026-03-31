@@ -10,11 +10,13 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
+use tokio::time::Duration;
+use tracing::{debug, warn};
 
-const SCAN_INTERVAL_SECS: u64 = 60;
-const MIN_ENTRY_PRICE: &str = "0.02";
-const MAX_ENTRY_PRICE: &str = "0.95";
+/// Fastest scan when a position is near the loss limit.
+const SCAN_INTERVAL_MIN_SECS: u64 = 10;
+/// Slowest scan when all positions are comfortably profitable.
+const SCAN_INTERVAL_MAX_SECS: u64 = 60;
 
 // ── Pure classifier (extracted for testability) ───────────────────────────────
 
@@ -50,25 +52,93 @@ pub fn start_position_scanner(
     tx: mpsc::Sender<TradeEvent>,
 ) {
     tokio::spawn(async move {
-        // Tracks tokens we've already queued this session — don't re-enter them
         let mut already_queued: HashSet<String> = HashSet::new();
 
-        // Run immediately on startup so TUI is populated before the next 60s tick
+        // Run immediately on startup so TUI is populated before the first sleep
         if let Err(e) = scan_positions(&config, &state, &tx, &mut already_queued).await {
             warn!("Initial position scan failed: {}", e);
         }
 
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(SCAN_INTERVAL_SECS));
-        interval.tick().await; // consume the immediate tick
-
         loop {
-            interval.tick().await;
+            // Compute next sleep based on how enterable the target's open positions still are.
+            // We scan quickly when a target position's price is still near their entry
+            // (good catch-up opportunity) and slowly when it has moved far away
+            // (we would be chasing) or is already filtered out by drawdown.
+            let interval_secs = {
+                let guard = state.read().await;
+                compute_scan_interval(&guard.target_positions, config.max_copy_loss_pct)
+            };
+            debug!(
+                "Next position scan in {}s (catch-up urgency: target entry proximity)",
+                interval_secs
+            );
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+
             if let Err(e) = scan_positions(&config, &state, &tx, &mut already_queued).await {
                 warn!("Position scan failed: {}", e);
             }
         }
     });
+}
+
+/// Compute the next scan interval (seconds) based on how close the TARGET's
+/// still-enterable positions are to their own average entry price.
+///
+/// Purpose: catch up on positions the target already had open when the bot started.
+/// We scan frequently when a target's Monitoring position is near their entry price
+/// (meaning we can still get a similar fill). We back off when:
+///   - The position has moved significantly from their entry (we'd be chasing)
+///   - The position is already in drawdown past `max_copy_loss_pct` (won't enter anyway)
+///   - There are no Monitoring positions at all
+///
+/// Algorithm (MAX_INTERESTING_MOVE = 15% as the "too late" threshold):
+///   closeness = 1 - |target_percent_pnl| / MAX_INTERESTING_MOVE   (clamped 0 → 1)
+///   interval  = MAX - best_closeness × (MAX - MIN)
+///
+/// Examples (max_copy_loss_pct = 10%, threshold = 15%):
+///   Target PnL =  0%  → closeness = 1.0 → 10s  (at entry — urgent catch-up)
+///   Target PnL = +5%  → closeness = 0.67 → 27s  (small move, still interesting)
+///   Target PnL = -5%  → closeness = 0.67 → 27s  (within drawdown, still enterable)
+///   Target PnL = -10% → closeness = 0.33 → 43s  (at limit, borderline)
+///   Target PnL = -11% → filtered out by classify_position (SkippedLoss)
+///   Target PnL = +15% → closeness = 0.0  → 60s  (too far, not worth scanning fast)
+///
+/// We NEVER exit based on this. Exits happen ONLY when the target exits.
+pub fn compute_scan_interval(
+    target_positions: &[TargetPosition],
+    max_copy_loss_pct: Decimal,
+) -> u64 {
+    // Beyond this absolute PnL move from the target's entry, the catch-up opportunity
+    // is no longer urgent (we'd be chasing). Must be > max_copy_loss_pct.
+    // 0.15 = 15 × 10^-2
+    let max_interesting_move = Decimal::new(15, 2);
+
+    // Consider only positions the scanner classifies as Monitoring (enterable).
+    // SkippedLoss, SkippedPrice, Entered, etc. are irrelevant — won't be entered.
+    let best_closeness = target_positions
+        .iter()
+        .filter(|p| p.status == ScanStatus::Monitoring && p.percent_pnl > -max_copy_loss_pct)
+        .map(|p| {
+            // How close is the current price to the target's average entry?
+            // percent_pnl near 0 → closeness near 1.0 → very urgent
+            // |percent_pnl| at or above threshold → closeness = 0 → not urgent
+            let abs_pnl = p.percent_pnl.abs();
+            (Decimal::ONE - abs_pnl / max_interesting_move).clamp(Decimal::ZERO, Decimal::ONE)
+        })
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(Decimal::ZERO);
+
+    // best_closeness = 1.0 → min interval (scan urgently)
+    // best_closeness = 0.0 → max interval (nothing interesting to catch up on)
+    let range = SCAN_INTERVAL_MAX_SECS - SCAN_INTERVAL_MIN_SECS;
+    let pct = (best_closeness * Decimal::from(100))
+        .round_dp(0)
+        .to_string()
+        .parse::<u64>()
+        .unwrap_or(0)
+        .min(100);
+    (SCAN_INTERVAL_MAX_SECS - pct * range / 100)
+        .clamp(SCAN_INTERVAL_MIN_SECS, SCAN_INTERVAL_MAX_SECS)
 }
 
 async fn scan_positions(
@@ -78,8 +148,8 @@ async fn scan_positions(
     already_queued: &mut HashSet<String>,
 ) -> Result<()> {
     let data_client = DataClient::default();
-    let min_price = Decimal::from_str(MIN_ENTRY_PRICE)?;
-    let max_price = Decimal::from_str(MAX_ENTRY_PRICE)?;
+    let min_price = config.min_entry_price;
+    let max_price = config.max_entry_price;
 
     // Brief read lock to snapshot our current holdings
     let our_token_ids: HashSet<String> = {
@@ -109,7 +179,7 @@ async fn scan_positions(
             }
         };
 
-        info!(
+        debug!(
             "Scanner: {} has {} open position(s)",
             wallet_str,
             positions.len()
@@ -192,16 +262,29 @@ async fn scan_positions(
         guard.target_positions = all_positions;
     }
 
-    // Queue entry events after releasing lock
-    for (token_id, event) in to_enter {
-        info!(
+    // Queue entry events after releasing lock.
+    // IMPORTANT: only enter ONE position per scan cycle — the one closest to the
+    // target's entry price (lowest |percent_pnl| = best catch-up opportunity).
+    // The next scan cycle will pick up the next-best position, and so on.
+    // This prevents depleting the wallet balance in a single burst.
+    to_enter.sort_by(|(_, a), (_, b)| {
+        // lower abs pnl from target's entry = better catch-up = enter first
+        let a_pnl = a.price; // price ≈ cur_price; use percent_pnl from all_positions
+        let b_pnl = b.price;
+        a_pnl
+            .partial_cmp(&b_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Pick only the single best opportunity this cycle
+    if let Some((token_id, event)) = to_enter.into_iter().next() {
+        debug!(
             "Scanner queuing entry for token {}",
             &token_id[..token_id.len().min(12)]
         );
         already_queued.insert(token_id);
         if let Err(e) = tx.send(event).await {
             warn!("Failed to send scan event: {}", e);
-            break;
         }
     }
 

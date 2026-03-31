@@ -27,6 +27,8 @@ fn test_config() -> polycopier::config::Config {
         max_trade_size_usd: dec!(10.00),
         max_delay_seconds: 2,
         max_copy_loss_pct: dec!(0.40),
+        min_entry_price: dec!(0.02),
+        max_entry_price: dec!(0.998),
     }
 }
 
@@ -94,8 +96,12 @@ mod config_tests {
     }
 
     #[test]
-    fn placeholder_too_short() {
-        assert!(is_placeholder("ab"));
+    fn placeholder_short_numeric_is_valid() {
+        // Short numeric values like "2" or "10" must NOT be flagged as placeholders
+        // (the old v.len() < 3 check incorrectly blocked these).
+        assert!(!is_placeholder("2"));
+        assert!(!is_placeholder("10"));
+        assert!(!is_placeholder("ab")); // ambiguous short string — now accepted
     }
 
     #[test]
@@ -740,6 +746,12 @@ mod strategy_engine_tests {
             config.clone(),
         );
 
+        // Seed sufficient balance so the pre-check doesn't block submission
+        {
+            let mut guard = state.write().await;
+            guard.total_balance = dec!(100);
+        }
+
         tx.send(make_trade("0xabc", dec!(0.50), dec!(10), TradeSide::BUY))
             .await
             .unwrap();
@@ -784,6 +796,12 @@ mod strategy_engine_tests {
         let log: Arc<Mutex<Vec<OrderRequest>>> = Arc::new(Mutex::new(vec![]));
         let (tx, rx) = mpsc::channel::<TradeEvent>(10);
         start_strategy_engine(rx, state.clone(), risk, mock_submitter(log.clone()), config);
+
+        // Seed sufficient balance so the pre-check doesn't block submission
+        {
+            let mut guard = state.write().await;
+            guard.total_balance = dec!(100);
+        }
 
         // 100 shares * $0.40 = $40 — capped to 10/0.40 = 25 shares
         tx.send(make_trade("0xabc", dec!(0.40), dec!(100), TradeSide::BUY))
@@ -1088,4 +1106,128 @@ fn zero_micro_usdc_is_zero_usdc() {
     let raw = dec!(0);
     let usdc = raw / dec!(1_000_000);
     assert_eq!(usdc, Decimal::ZERO);
+}
+
+// ── Adaptive scan interval tests ──────────────────────────────────────────────
+
+mod scan_interval_tests {
+    use super::*;
+    use polycopier::position_scanner::compute_scan_interval;
+
+    const MAX_LOSS: Decimal = dec!(0.10); // 10%
+    const MIN_S: u64 = 10;
+    const MAX_S: u64 = 60;
+
+    /// Build a target position at a given percent_pnl with Monitoring status.
+    fn monitoring(pnl: Decimal) -> TargetPosition {
+        TargetPosition {
+            title: "T".to_string(),
+            outcome: "Yes".to_string(),
+            token_id: "tok".to_string(),
+            cur_price: dec!(0.50),
+            avg_price: dec!(0.50),
+            percent_pnl: pnl,
+            size: dec!(10),
+            status: ScanStatus::Monitoring,
+        }
+    }
+
+    /// Build a target position with a non-Monitoring status (should be ignored).
+    fn skipped(pnl: Decimal, status: ScanStatus) -> TargetPosition {
+        TargetPosition {
+            status,
+            percent_pnl: pnl,
+            ..monitoring(pnl)
+        }
+    }
+
+    #[test]
+    fn no_monitoring_positions_returns_max_interval() {
+        // Nothing enterable → no urgency → scan at slowest rate
+        let interval = compute_scan_interval(&[], MAX_LOSS);
+        assert_eq!(interval, MAX_S);
+    }
+
+    #[test]
+    fn target_at_entry_price_is_most_urgent() {
+        // pnl = 0% → closeness = 1.0 → MIN interval (scan every 10s)
+        let positions = [monitoring(dec!(0))];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert_eq!(
+            interval, MIN_S,
+            "price at entry should trigger fastest scan"
+        );
+    }
+
+    #[test]
+    fn target_with_small_move_is_still_urgent() {
+        // pnl = +5% → closeness = 1 - 0.05/0.15 ≈ 0.67 → ~27s
+        let positions = [monitoring(dec!(0.05))];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert!(
+            interval < 35,
+            "small move should still be urgent, got {}s",
+            interval
+        );
+    }
+
+    #[test]
+    fn target_in_small_drawdown_still_scanned_urgently() {
+        // pnl = -5% (within allowed drawdown) → closeness = 1 - 0.05/0.15 ≈ 0.67 → ~27s
+        // We should still scan frequently — it's enterable and near the target's entry
+        let positions = [monitoring(dec!(-0.05))];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert!(
+            interval < 40,
+            "position within drawdown should still scan frequently, got {}s",
+            interval
+        );
+    }
+
+    #[test]
+    fn target_far_from_entry_scans_slowly() {
+        // pnl = +15% → closeness = 0 → MAX interval, we'd be chasing
+        let positions = [monitoring(dec!(0.15))];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert_eq!(interval, MAX_S, "price moved 15%+ from entry — no urgency");
+    }
+
+    #[test]
+    fn target_beyond_drawdown_is_excluded() {
+        // pnl = -11% which is below max_copy_loss_pct=10% → classify_position filters this
+        // compute_scan_interval also excludes it → MAX interval
+        let positions = [monitoring(dec!(-0.11))];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert_eq!(
+            interval, MAX_S,
+            "position past drawdown limit should not create urgency"
+        );
+    }
+
+    #[test]
+    fn non_monitoring_positions_are_ignored() {
+        // Entered, SkippedLoss, etc. are not candidates — should not affect interval
+        let positions = [
+            skipped(dec!(0.0), ScanStatus::Entered), // would be urgent if counted
+            skipped(dec!(-0.11), ScanStatus::SkippedLoss), // past drawdown
+        ];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert_eq!(
+            interval, MAX_S,
+            "non-Monitoring positions should not drive urgency"
+        );
+    }
+
+    #[test]
+    fn best_opportunity_drives_urgency() {
+        // Three positions: one far from entry, one at entry, one past drawdown
+        // The one at entry should dominate → MIN interval
+        let positions = [
+            monitoring(dec!(0.20)),  // too far → closeness 0
+            monitoring(dec!(0.0)),   // at entry → closeness 1.0 → urgent
+            monitoring(dec!(-0.11)), // past drawdown → filtered
+        ];
+        let interval = compute_scan_interval(&positions, MAX_LOSS);
+        assert_eq!(interval, MIN_S, "best opportunity should dominate");
+    }
 }

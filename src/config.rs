@@ -16,6 +16,10 @@ pub struct Config {
     pub max_delay_seconds: i64,
     /// Skip copying a position if the target is already this % underwater (e.g. 0.40 = 40% down)
     pub max_copy_loss_pct: Decimal,
+    /// Minimum token price for catch-up entries (default 0.02 — filters near-zero dust)
+    pub min_entry_price: Decimal,
+    /// Maximum token price for catch-up entries (default 0.98 — allows near-certainty positions)
+    pub max_entry_price: Decimal,
 }
 
 /// Returns true if a config value looks like a placeholder that hasn't been filled in.
@@ -27,7 +31,7 @@ pub fn is_placeholder(val: &str) -> bool {
         || v.starts_with("0xYour")
         || v.starts_with("0xTarget")
         || v.contains("here")
-        || v.len() < 3
+    // Note: no length check — short numeric values like "2" or "10" are valid
 }
 
 impl Config {
@@ -131,6 +135,12 @@ impl Config {
             }
         };
 
+        // Price range for catch-up entries — read from env, no prompt (advanced setting)
+        let min_entry_price_str =
+            env::var("MIN_ENTRY_PRICE").unwrap_or_else(|_| "0.02".to_string());
+        let max_entry_price_str =
+            env::var("MAX_ENTRY_PRICE").unwrap_or_else(|_| "0.999".to_string());
+
         if write_new_env {
             println!("Saving credentials to .env...");
             let mut file = OpenOptions::new()
@@ -146,6 +156,8 @@ impl Config {
             writeln!(file, "MAX_TRADE_SIZE_USD=\"{}\"", max_trade_size_str)?;
             writeln!(file, "MAX_DELAY_SECONDS=\"{}\"", max_delay_str)?;
             writeln!(file, "MAX_COPY_LOSS_PCT=\"{}\"", max_copy_loss_str)?;
+            writeln!(file, "MIN_ENTRY_PRICE=\"{}\"", min_entry_price_str)?;
+            writeln!(file, "MAX_ENTRY_PRICE=\"{}\"", max_entry_price_str)?;
         }
 
         let target_wallets: Vec<String> = target_wallets_str
@@ -168,6 +180,14 @@ impl Config {
             .parse::<Decimal>()
             .unwrap_or_else(|_| Decimal::from_str("0.40").unwrap());
 
+        let min_entry_price = min_entry_price_str
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap());
+
+        let max_entry_price = max_entry_price_str
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::from_str("0.98").unwrap());
+
         Ok(Self {
             private_key,
             funder_address,
@@ -177,6 +197,8 @@ impl Config {
             max_trade_size_usd,
             max_delay_seconds,
             max_copy_loss_pct,
+            min_entry_price,
+            max_entry_price,
         })
     }
 }

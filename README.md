@@ -20,38 +20,75 @@ built in Rust against the official [`polymarket-client-sdk`](https://github.com/
 ## Overview
 
 polycopier monitors one or more target wallets on Polymarket and automatically mirrors
-their trades into your own account in real time. Beyond reactive copying, it also scans
-the target's full open-position portfolio at regular intervals, evaluating whether each
-position still represents a sensible entry — and acting on those that do.
+their trades into your own account in real time.
 
-The entire interface is a terminal UI (TUI) that displays live activity, your own holdings,
-and the opportunity scanner side-by-side with no browser required.
+**Two independent signal sources feed the same execution engine:**
+
+1. **Real-time listener** — polls the Data API every 2 seconds and copies new fills the
+   moment they appear, using transaction-hash deduplication to handle burst activity.
+
+2. **Adaptive position scanner** — scans the target's full open-position portfolio and
+   evaluates catch-up entries (positions the target had open before the bot started).
+   Scan frequency adapts dynamically between 10 and 60 seconds based on how close each
+   target position's current price is to their original entry — scanning most aggressively
+   when a catch-up entry is still at a favorable price.
+
+**Trade intent classification** — the bot tracks the target's current positions (via the
+scanner data) and uses them to classify every event before acting:
+
+| Target has position? | Event | Bot has position? | Intent | Action |
+|---|---|---|---|---|
+| No | BUY | No | Fresh long entry | Copy BUY |
+| Yes | BUY | Any | Adding to long | Copy BUY |
+| No | BUY | Yes | Closing a short | **Skip** |
+| Yes | SELL | Yes | Closing long | Copy SELL |
+| Yes | SELL | No | Closing long we missed | **Skip** |
+| No | SELL | Any | Opening a short | **Skip** |
+
+The bot **never exits a position autonomously**. All exits are triggered only when the
+target wallet closes their position.
+
+The entire interface is a terminal UI (TUI) with no browser required.
 
 ---
 
 ## Features
 
-- **Real-time trade copying** — polls the Polymarket Data API every 2 seconds and mirrors
-  qualified trades within your configured slippage and size limits.
+- **Real-time trade copying** — polls the Polymarket Data API every 2 seconds with a
+  rate limit of 20 fills per cycle. Deduplicates by transaction hash (not timestamp) so
+  burst activity is never silently dropped.
 
-- **Open-position scanner** — fetches the target wallet's full portfolio every 60 seconds
-  and evaluates each position against entry criteria: price range, unrealized loss threshold,
-  and whether you already hold the token.
+- **Adaptive open-position scanner** — catches positions the target opened before the bot
+  started. Scan interval scales from 10s (target position still at entry price) to 60s
+  (price has moved significantly or no enterable positions exist).
 
-- **Interactive setup wizard** — on first run the bot prompts for all required credentials
-  and saves them to `.env`. Subsequent runs load from the saved file automatically.
+- **Intent classification** — every incoming BUY and SELL is checked against the target's
+  last-known positions to determine true intent (fresh entry, adding to long, closing long,
+  closing short). Short entries and short closures by the target are correctly skipped.
 
-- **Live balance tracking** — the CLOB API is polled every 10 seconds so your USDC balance
-  stays current in the dashboard.
+- **SELL execution guards**:
+  - 97% collateral buffer applied to all SELL sizes to satisfy the CLOB's fee reserve requirement.
+  - SELL quantities are based on **our own held size**, not the target's order size.
+  - SELL is never submitted for a token we don't hold.
 
-- **Risk engine** — built-in spoofing protection (minimum notional value) and per-trade
-  size cap. Easily extensible for drawdown limits and exposure controls.
+- **BUY floor** — entry size targets a minimum of $1.10 notional to prevent rounding errors
+  from dropping below the CLOB's $1.00 minimum order size.
 
-- **Terminal UI** — a four-panel ratatui interface showing:
+- **Interactive setup wizard** — prompts for all credentials on first run and saves to `.env`.
+
+- **Live balance tracking** — CLOB balance polled every 10 seconds.
+
+- **Risk engine** — per-trade minimum notional ($1.00), per-trade size cap, and
+  per-position drawdown filter (`MAX_COPY_LOSS_PCT`).
+
+- **Terminal UI** — four-panel ratatui interface:
   - Account dashboard (balance, PnL, copy stats)
-  - Live copy feed with pass/fail status per event
+  - Live copy feed (pass/fail, skip reason per event)
   - Your open positions
-  - Full opportunity scanner table (color-coded by entry status)
+  - Opportunity scanner table (color-coded by status)
+
+- **Pre-commit quality gates** — `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
+  run automatically before every commit via `.githooks/pre-commit`.
 
 ---
 
@@ -71,6 +108,8 @@ and the opportunity scanner side-by-side with no browser required.
 ```bash
 git clone https://github.com/cbaezp/polycopier
 cd polycopier
+# Enable the pre-commit quality gate
+git config core.hooksPath .githooks
 cargo build --release
 ```
 
@@ -98,8 +137,10 @@ cargo run --release
 | `TARGET_WALLETS` | Yes | — | Comma-separated list of target proxy wallet addresses to copy |
 | `MAX_SLIPPAGE_PCT` | No | `0.02` | Maximum allowed price deviation from the copied trade (2% = `0.02`) |
 | `MAX_TRADE_SIZE_USD` | No | `10.00` | Maximum USDC to spend per copied trade |
-| `MAX_DELAY_SECONDS` | No | `2` | Discard live trade events older than this many seconds |
-| `MAX_COPY_LOSS_PCT` | No | `0.40` | Skip open-position entries where the target is already this far underwater (40% = `0.40`) |
+| `MAX_DELAY_SECONDS` | No | `10` | Discard live trade events (listener) older than this many seconds |
+| `MAX_COPY_LOSS_PCT` | No | `0.40` | Skip catch-up entries where the target is already this far underwater (40% = `0.40`) |
+| `MIN_ENTRY_PRICE` | No | `0.02` | Minimum token price accepted for catch-up entries (filters near-zero dust) |
+| `MAX_ENTRY_PRICE` | No | `0.998` | Maximum token price accepted for catch-up entries. Raise above `0.95` when copying targets who trade high-confidence NO positions (e.g. `0.998`) |
 
 ### Wallet Type
 
@@ -130,6 +171,15 @@ On first run with an empty or placeholder `.env`, the setup wizard prompts for:
 
 All values are saved to `.env` and reused on subsequent runs.
 
+### Logging
+
+By default the bot suppresses all log output below `WARN` level to keep the TUI clean.
+To see verbose diagnostic output:
+
+```bash
+RUST_LOG=debug cargo run --release
+```
+
 ### Keyboard Controls
 
 | Key | Action |
@@ -147,19 +197,21 @@ main.rs
   |
   +-- clients.rs         CLOB authentication + order submission + balance fetcher
   |
-  +-- listener.rs        Data API polling loop (2s interval) -> TradeEvent channel
+  +-- listener.rs        Data API polling loop (2s, hash-dedup) -> TradeEvent channel
   |
-  +-- position_scanner.rs  Open-position mirror scanner (60s interval) -> TradeEvent channel
+  +-- position_scanner.rs  Catch-up scanner (adaptive 10–60s) -> TradeEvent channel
   |
-  +-- strategy.rs        Receives TradeEvents, applies debounce + risk checks, submits orders
+  +-- strategy.rs        Receives TradeEvents, classifies intent, applies risk checks,
+  |                       submits orders via OrderSubmitter
   |
   +-- risk.rs            RiskEngine: minimum notional, max size enforcement
   |
-  +-- state.rs           Shared BotState (Arc<RwLock<_>>): balance, positions, feed, scanner data
+  +-- state.rs           Shared BotState (Arc<RwLock<_>>): balance, our positions,
+  |                       target positions, live feed, TUI counters
   |
   +-- ui.rs              ratatui TUI: dashboard, live feed, positions, opportunity scanner
   |
-  +-- models.rs          Core data types: TradeEvent, EvaluatedTrade, TargetPosition, ScanStatus
+  +-- models.rs          Core types: TradeEvent, EvaluatedTrade, TargetPosition, ScanStatus
   +-- utils.rs           Timestamp formatting helpers
 ```
 
@@ -168,34 +220,47 @@ main.rs
 ```
 Polymarket Data API
     |
-    +-- listener (2s poll) ------------> mpsc::Sender<TradeEvent>
-    |                                              |
-    +-- position_scanner (60s poll) ---> mpsc::Sender<TradeEvent> (cloned)
-                                                   |
-                                         strategy engine
-                                           - wallet filter
-                                           - debounce (fragmented fills)
-                                           - risk check
-                                           - size cap
-                                                   |
-                                         CLOB API  (order submission)
+    +-- listener (2s poll, limit 20, hash-dedup) -----> mpsc::Sender<TradeEvent>
+    |                                                              |
+    +-- position_scanner (adaptive 10–60s poll) -----> mpsc::Sender<TradeEvent> (cloned)
+                                                                   |
+                                                         strategy engine
+                                                           - wallet filter
+                                                           - intent classification
+                                                             (target_positions lookup)
+                                                           - risk check (notional, size)
+                                                           - SELL guard (must hold position)
+                                                           - 97% SELL buffer
+                                                                   |
+                                                         CLOB API  (order submission)
 ```
 
 ---
 
 ## Opportunity Scanner Logic
 
-The position scanner evaluates each of the target's open positions against four criteria
-in order. A position is skipped at the first failing guard:
+The scanner fetches the target's full open portfolio and evaluates each position in order.
+A position is skipped at the first failing guard:
 
 1. **Already held** — the bot already holds this token (`SkippedOwned`)
 2. **Already queued** — an entry order was sent this session (`Entered`)
 3. **Price range** — current price must be between `$0.02` and `$0.95` (`SkippedPrice`)
 4. **Loss threshold** — the target's unrealized loss must be less than `MAX_COPY_LOSS_PCT` (`SkippedLoss`)
 
-Positions that pass all guards are classified as `Monitoring` (shown in green in the TUI)
-and an entry order is queued. Entries are size-capped to `MAX_TRADE_SIZE_USD / cur_price`
-and rounded to two decimal places (the SDK's lot-size constraint).
+Positions passing all guards are classified as `Monitoring` (green in TUI) and an entry is queued.
+
+### Catch-up Intervals
+
+The scanner reschedules itself after each cycle based on the best available opportunity:
+
+| Target position state | Scan interval |
+|---|---|
+| Price exactly at target's entry (0% PnL) | 10s |
+| Small move (±5%) | ~27s |
+| Moderate move (±10%) | ~43s |
+| Large move (±15%+) — would be chasing | 60s |
+| No enterable (Monitoring) positions | 60s |
+| Position past `MAX_COPY_LOSS_PCT` | 60s (filtered out) |
 
 ---
 
@@ -205,14 +270,20 @@ and rounded to two decimal places (the SDK's lot-size constraint).
 # Run with live reloading (requires cargo-watch)
 cargo watch -x run
 
-# Check for errors and warnings
-cargo check
+# Run the full test suite (82 tests, all pure/unit — no network)
+cargo test --all
 
-# Run clippy lints
-cargo clippy -- -D warnings
+# Lint
+cargo clippy --all-targets -- -D warnings
 
-# Format code
+# Format
 cargo fmt
+```
+
+The pre-commit hook runs fmt + clippy + tests automatically. To install it:
+
+```bash
+git config core.hooksPath .githooks
 ```
 
 ---
@@ -231,8 +302,7 @@ cargo fmt
 
 Releases are created automatically by GitHub Actions whenever a version tag is pushed.
 The workflow builds binaries for macOS (Apple Silicon), macOS (Intel), and Linux, then
-publishes a GitHub Release with the compiled artifacts attached and release notes generated
-from commits since the previous tag.
+publishes a GitHub Release with the compiled artifacts attached.
 
 To cut a release:
 
@@ -240,9 +310,6 @@ To cut a release:
 git tag v0.1.0
 git push origin v0.1.0
 ```
-
-GitHub Actions will handle the rest. The release will appear at
-`https://github.com/cbaezp/polycopier/releases` within a few minutes.
 
 Pre-release versions (e.g. `v0.2.0-beta`) are automatically marked as pre-release on GitHub.
 
