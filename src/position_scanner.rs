@@ -58,13 +58,13 @@ pub fn start_position_scanner(
         // Run immediately on startup so TUI is populated before the first sleep
         if let Err(e) = scan_positions(&config, &state, &tx, &mut already_queued).await {
             warn!("Initial position scan failed: {}", e);
+        } else {
+            let mut g = state.write().await;
+            g.last_scan_at = Some(std::time::Instant::now());
         }
 
         loop {
             // Compute next sleep based on how enterable the target's open positions still are.
-            // We scan quickly when a target position's price is still near their entry
-            // (good catch-up opportunity) and slowly when it has moved far away
-            // (we would be chasing) or is already filtered out by drawdown.
             let interval_secs = {
                 let guard = state.read().await;
                 compute_scan_interval(&guard.target_positions, config.max_copy_loss_pct)
@@ -73,10 +73,18 @@ pub fn start_position_scanner(
                 "Next position scan in {}s (catch-up urgency: target entry proximity)",
                 interval_secs
             );
+            // Record the scheduled interval so the TUI can show a countdown
+            {
+                let mut g = state.write().await;
+                g.next_scan_secs = interval_secs;
+            }
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
 
             if let Err(e) = scan_positions(&config, &state, &tx, &mut already_queued).await {
                 warn!("Position scan failed: {}", e);
+            } else {
+                let mut g = state.write().await;
+                g.last_scan_at = Some(std::time::Instant::now());
             }
         }
     });
@@ -304,6 +312,7 @@ async fn scan_positions(
         let mut guard = state.write().await;
         guard.target_positions = all_positions;
         guard.target_portfolio_usd = target_portfolio_usd;
+        guard.last_scan_at = Some(std::time::Instant::now());
     }
 
     // Queue entry events after releasing lock.

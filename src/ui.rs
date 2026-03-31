@@ -45,6 +45,12 @@ struct Snap {
     skips: u32,
     /// Last N log entries for the log panel (newest last).
     logs: Vec<(String, String, String)>, // (timestamp, level, message)
+    /// Seconds since the scanner last completed a full cycle (None = not run yet).
+    last_scan_secs_ago: Option<u64>,
+    /// Scheduled seconds until the NEXT scan.
+    next_scan_secs: u64,
+    /// Seconds since the price-refresh task last updated cur_price (None = not run yet).
+    last_price_refresh_secs_ago: Option<u64>,
 }
 
 fn shorten(addr: &str) -> String {
@@ -119,6 +125,9 @@ pub async fn start_tui(
                 copied_count: g.copied_count,
                 skips: g.trades_skipped,
                 logs,
+                last_scan_secs_ago: g.last_scan_at.map(|t| t.elapsed().as_secs()),
+                next_scan_secs: g.next_scan_secs,
+                last_price_refresh_secs_ago: g.last_price_refresh_at.map(|t| t.elapsed().as_secs()),
             }
         };
 
@@ -563,15 +572,32 @@ fn render_scanner(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
         .count();
     let total = snap.target_positions.len();
 
+    let scan_timing = {
+        let ago = match snap.last_scan_secs_ago {
+            Some(s) => format!("{}s ago", s),
+            None => "pending".to_string(),
+        };
+        let next = if snap.next_scan_secs > 0 {
+            format!("next: {}s", snap.next_scan_secs)
+        } else {
+            "next: --".to_string()
+        };
+        let price_refresh = match snap.last_price_refresh_secs_ago {
+            Some(s) => format!("prices: {}s ago", s),
+            None => "prices: pending".to_string(),
+        };
+        format!("scan: {}  {}  {}", ago, next, price_refresh)
+    };
+
     let title = if let Some(portfolio) = snap.target_portfolio_est {
         format!(
-            " [S] Opportunity Scanner  -- {} watching / {} tracked | Est. target portfolio: ${:.0} ",
-            watch, total, portfolio
+            " [S] Opportunity Scanner  {} | {} watching / {} tracked | portfolio: ${:.0} ",
+            scan_timing, watch, total, portfolio
         )
     } else {
         format!(
-            " [S] Opportunity Scanner  -- {} watching / {} tracked ",
-            watch, total
+            " [S] Opportunity Scanner  {} | {} watching / {} tracked ",
+            scan_timing, watch, total
         )
     };
 

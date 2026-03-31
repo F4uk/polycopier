@@ -103,7 +103,59 @@ async fn main() -> anyhow::Result<()> {
         30,
     );
 
-    // 10. Poll live USDC balance every 10 seconds and update TUI
+    // 11. Dedicated price refresh task.
+    //     The scanner's adaptive interval can reach 60s when all target positions are
+    //     deeply in-the-money (best_closeness = 0). This means OUR_PNL% in the Copied
+    //     table would show prices up to 60s stale.
+    //     This task refreshes cur_price in target_positions every 20 seconds,
+    //     completely independent of scanner urgency. It patches ONLY cur_price -- it
+    //     does not re-run classification logic or queue any trade events.
+    {
+        use alloy::primitives::Address;
+        use polymarket_client_sdk::data::types::request::PositionsRequest;
+        use polymarket_client_sdk::data::Client as DataClient;
+        use std::collections::HashMap;
+        use std::str::FromStr;
+
+        let targets = config.target_wallets.clone();
+        let state_pr = state.clone();
+
+        tokio::spawn(async move {
+            let client = DataClient::default();
+            // Small initial delay so scanner runs first and populates target_positions
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            loop {
+                // Fetch fresh prices from each target wallet
+                let mut price_map: HashMap<String, rust_decimal::Decimal> = HashMap::new();
+                for wallet_str in &targets {
+                    let wallet_str = wallet_str.trim();
+                    if let Ok(addr) = Address::from_str(wallet_str) {
+                        let req = PositionsRequest::builder().user(addr).build();
+                        if let Ok(ps) = client.positions(&req).await {
+                            for p in ps {
+                                price_map.insert(p.asset.to_string(), p.cur_price);
+                            }
+                        }
+                    }
+                }
+
+                if !price_map.is_empty() {
+                    let mut g = state_pr.write().await;
+                    for tp in g.target_positions.iter_mut() {
+                        if let Some(&fresh_price) = price_map.get(&tp.token_id) {
+                            tp.cur_price = fresh_price;
+                        }
+                    }
+                    g.last_price_refresh_at = Some(std::time::Instant::now());
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+            }
+        });
+    }
+
+    // 12. Poll live USDC balance every 10 seconds and update TUI
+
     {
         let state = state.clone();
         tokio::spawn(async move {
