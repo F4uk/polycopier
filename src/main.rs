@@ -1,6 +1,7 @@
 pub mod clients;
 pub mod config;
 pub mod listener;
+pub mod log_capture;
 pub mod models;
 pub mod position_scanner;
 pub mod risk;
@@ -11,17 +12,19 @@ pub mod utils;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Initialize logging - set to WARN to prevent log lines bleeding into the TUI.
-    //    For diagnostic detail run: RUST_LOG=debug cargo run
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // 1. Set up in-memory log capture so tracing output goes to the TUI log
+    //    panel instead of corrupting the alternate-screen TUI.
+    //    RUST_LOG is still honoured for the level filter.
+    let log_buffer = log_capture::new_log_buffer();
+    let tui_layer = log_capture::TuiLogLayer::new(log_buffer.clone());
+    let level_filter = tracing_subscriber::filter::LevelFilter::WARN;
+    tracing_subscriber::registry()
+        .with(tui_layer.with_filter(level_filter))
+        .init();
 
     // 2. Load Configuration via Prompt Wizard
     let config = config::Config::load_or_prompt().await?;
@@ -90,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     // 9. Scan target wallets for pre-existing open positions (startup + adaptive interval)
     position_scanner::start_position_scanner(config.clone(), state.clone(), event_tx);
 
-    // 8. Poll live USDC balance every 10 seconds and update TUI
+    // 10. Poll live USDC balance every 10 seconds and update TUI
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -107,8 +110,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 8. Start Terminal UI (Blocks main thread)
-    ui::start_tui(state.clone(), config.clone()).await?;
+    // 11. Start Terminal UI (blocks main thread).
+    //     Returns TuiExit::Settings when [s] is pressed, causing us to
+    //     re-run the config wizard and restart the bot.
+    match ui::start_tui(state.clone(), config.clone(), log_buffer.clone()).await? {
+        ui::TuiExit::Quit => {}
+        ui::TuiExit::Settings => {
+            // Re-run the wizard; the new .env is written by load_or_prompt.
+            // Then restart the process in-place so the new config is loaded.
+            drop(config::Config::load_or_prompt().await?);
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().collect();
+            let _ = std::process::Command::new(&exe).args(&args[1..]).status();
+        }
+    }
 
     Ok(())
 }

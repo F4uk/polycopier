@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::log_capture::LogBuffer;
 use crate::models::{EvaluatedTrade, Position, TargetPosition, TradeSide};
 use crate::state::BotState;
 use crate::utils;
@@ -21,6 +22,15 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// -- Exit signal ---------------------------------------------------------------
+/// Returned by start_tui to tell main what to do next.
+pub enum TuiExit {
+    /// User pressed [q] -- shut down.
+    Quit,
+    /// User pressed [s] -- run settings wizard then restart.
+    Settings,
+}
+
 // -- Snapshot cloned out of the RwLock each frame ------------------------------
 struct Snap {
     balance: Decimal,
@@ -30,10 +40,11 @@ struct Snap {
     positions: Vec<Position>,
     target_positions: Vec<TargetPosition>,
     target_portfolio_est: Option<Decimal>,
-    /// Positions WE hold that the target ALSO holds right now.
-    /// Cross-referenced from both position maps -- accurate across restarts.
+    /// Positions WE hold that the target ALSO holds (HELD status).
     copied_count: usize,
     skips: u32,
+    /// Last N log entries for the log panel (newest last).
+    logs: Vec<(String, String, String)>, // (timestamp, level, message)
 }
 
 fn shorten(addr: &str) -> String {
@@ -54,17 +65,42 @@ fn pnl_color(v: Decimal) -> Color {
     }
 }
 
+// -- Number of log lines visible in the log panel ------------------------------
+const LOG_PANEL_LINES: usize = 5;
+
 // ------------------------------------------------------------------------------
-pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<()> {
+pub async fn start_tui(
+    state: Arc<RwLock<BotState>>,
+    config: Config,
+    log_buffer: LogBuffer,
+) -> Result<TuiExit> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    loop {
+    let exit = loop {
+        // -- Snapshot state (brief read lock) ----------------------------------
         let snap = {
             let g = state.read().await;
+
+            // Grab the last LOG_PANEL_LINES log entries from the buffer
+            let logs = {
+                if let Ok(buf) = log_buffer.try_lock() {
+                    buf.iter()
+                        .rev()
+                        .take(LOG_PANEL_LINES)
+                        .map(|e| (e.timestamp.clone(), e.level.clone(), e.message.clone()))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect()
+                } else {
+                    vec![]
+                }
+            };
+
             Snap {
                 balance: g.total_balance,
                 realized_pnl: g.realized_pnl,
@@ -78,15 +114,13 @@ pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<(
                 } else {
                     None
                 },
-                // Count positions the target holds that we ALSO hold.
-                // The scanner already classifies these as SkippedOwned (HELD)
-                // so this is just a tally of that bucket -- no extra work needed.
                 copied_count: g
                     .target_positions
                     .iter()
                     .filter(|p| p.status == crate::models::ScanStatus::SkippedOwned)
                     .count(),
                 skips: g.trades_skipped,
+                logs,
             }
         };
 
@@ -94,13 +128,16 @@ pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<(
 
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(k) = event::read()? {
-                if k.code == KeyCode::Char('q') {
-                    break;
+                match k.code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') => break TuiExit::Quit,
+                    KeyCode::Char('s') | KeyCode::Char('S') => break TuiExit::Settings,
+                    _ => {}
                 }
             }
         }
-    }
+    };
 
+    // -- Clean up terminal -----------------------------------------------------
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -108,26 +145,28 @@ pub async fn start_tui(state: Arc<RwLock<BotState>>, config: Config) -> Result<(
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    Ok(())
+    Ok(exit)
 }
 
 // ------------------------------------------------------------------------------
 fn render(f: &mut Frame, snap: &Snap, config: &Config) {
     let area = f.size();
 
-    // -- Outer vertical split: header / body / footer --------------------------
+    // Outer vertical split:  header | body | logs | footer
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // header
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // footer
+            Constraint::Length(5),                          // header
+            Constraint::Min(0),                             // body (scanner + feed)
+            Constraint::Length(LOG_PANEL_LINES as u16 + 2), // log panel (+ 2 for border)
+            Constraint::Length(1),                          // footer
         ])
         .split(area);
 
     render_header(f, snap, config, outer[0]);
-    render_body(f, snap, outer[1]);
-    render_footer(f, outer[2]);
+    render_body(f, snap, config, outer[1]);
+    render_logs(f, &snap.logs, outer[2]);
+    render_footer(f, outer[3]);
 }
 
 // -- Header --------------------------------------------------------------------
@@ -230,7 +269,7 @@ fn render_header(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::lay
 }
 
 // -- Body: left panel + right panel -------------------------------------------
-fn render_body(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
+fn render_body(f: &mut Frame, snap: &Snap, config: &Config, area: ratatui::layout::Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -245,8 +284,14 @@ fn render_body(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     render_live_feed(f, snap, left[0]);
     render_our_positions(f, snap, left[1]);
 
-    // Right: opportunity scanner
-    render_scanner(f, snap, cols[1]);
+    // Right: opportunity scanner (top) + settings summary (bottom)
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(cols[1]);
+
+    render_scanner(f, snap, right[0]);
+    render_settings(f, config, right[1]);
 }
 
 // -- Live Feed ----------------------------------------------------------------
@@ -454,16 +499,130 @@ fn render_scanner(f: &mut Frame, snap: &Snap, area: ratatui::layout::Rect) {
     f.render_widget(table, area);
 }
 
+// -- Settings Summary ----------------------------------------------------------
+fn render_settings(f: &mut Frame, config: &Config, area: ratatui::layout::Rect) {
+    let label = Style::default().fg(Color::DarkGray);
+    let val = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let sizing_str = config.sizing_mode.as_str().to_string();
+    let sizing_detail = match &config.copy_size_pct {
+        Some(pct) => format!(
+            "{}  (COPY_SIZE_PCT: {:.0}%)",
+            sizing_str,
+            pct * rust_decimal::Decimal::from(100)
+        ),
+        None => sizing_str,
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  Sizing:      ", label),
+            Span::styled(sizing_detail, val),
+        ]),
+        Line::from(vec![
+            Span::styled("  Max trade:   ", label),
+            Span::styled(format!("${:.2}", config.max_trade_size_usd), val),
+            Span::styled("   Slippage: ", label),
+            Span::styled(
+                format!(
+                    "{:.1}%",
+                    config.max_slippage_pct * rust_decimal::Decimal::from(100)
+                ),
+                val,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Loss limit:  ", label),
+            Span::styled(
+                format!(
+                    "{:.0}%",
+                    config.max_copy_loss_pct * rust_decimal::Decimal::from(100)
+                ),
+                val,
+            ),
+            Span::styled("   Targets: ", label),
+            Span::styled(format!("{}", config.target_wallets.len()), val),
+        ]),
+        Line::from(Span::styled(
+            "  [s] Edit settings   (re-runs wizard, restarts bot)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title(Span::styled(
+                " Settings ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(widget, area);
+}
+
+// -- Log Panel -----------------------------------------------------------------
+fn render_logs(f: &mut Frame, logs: &[(String, String, String)], area: ratatui::layout::Rect) {
+    let items: Vec<ListItem> = if logs.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  No warnings yet.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        logs.iter()
+            .map(|(ts, level, msg)| {
+                let level_color = if level == "WARN" {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                let line = Line::from(vec![
+                    Span::styled(format!(" {} ", ts), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("[{}] ", level),
+                        Style::default()
+                            .fg(level_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(msg.as_str(), Style::default().fg(Color::White)),
+                ]);
+                ListItem::new(line)
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(Span::styled(
+                " System Logs (WARN+) ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    f.render_widget(list, area);
+}
+
 // -- Footer --------------------------------------------------------------------
 fn render_footer(f: &mut Frame, area: ratatui::layout::Rect) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("  [q] Quit", Style::default().fg(Color::Red)),
         Span::styled(
-            "     Press any key to interact",
-            Style::default().fg(Color::DarkGray),
+            "   [s] Settings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "                         POLYCOPIER v0.1 - Powered by Polymarket SDK",
+            "                    POLYCOPIER v0.1 - Powered by Polymarket SDK",
             Style::default().fg(Color::DarkGray),
         ),
     ]))
