@@ -1,6 +1,8 @@
 pub mod clients;
 pub mod config;
+pub mod copied_counter;
 pub mod listener;
+pub mod log_capture;
 pub mod models;
 pub mod position_scanner;
 pub mod risk;
@@ -11,17 +13,19 @@ pub mod utils;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Initialize logging — set to WARN to prevent log lines bleeding into the TUI.
-    //    For diagnostic detail run: RUST_LOG=debug cargo run
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // 1. Set up in-memory log capture so tracing output goes to the TUI log
+    //    panel instead of corrupting the alternate-screen TUI.
+    //    RUST_LOG is still honoured for the level filter.
+    let log_buffer = log_capture::new_log_buffer();
+    let tui_layer = log_capture::TuiLogLayer::new(log_buffer.clone());
+    let level_filter = tracing_subscriber::filter::LevelFilter::WARN;
+    tracing_subscriber::registry()
+        .with(tui_layer.with_filter(level_filter))
+        .init();
 
     // 2. Load Configuration via Prompt Wizard
     let config = config::Config::load_or_prompt().await?;
@@ -77,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                         tracing::warn!(
-                            "Seeded {} existing position(s) from wallet — scanner will skip these.",
+                            "Seeded {} existing position(s) from wallet - scanner will skip these.",
                             guard.positions.len()
                         );
                     }
@@ -90,7 +94,68 @@ async fn main() -> anyhow::Result<()> {
     // 9. Scan target wallets for pre-existing open positions (startup + adaptive interval)
     position_scanner::start_position_scanner(config.clone(), state.clone(), event_tx);
 
-    // 8. Poll live USDC balance every 10 seconds and update TUI
+    // 10. Dedicated "Copied" counter: queries our wallet and each target via the
+    //     API every 30 seconds and writes the intersection count to state.copied_count.
+    copied_counter::start_copied_counter(
+        config.funder_address.clone(),
+        config.target_wallets.clone(),
+        state.clone(),
+        30,
+    );
+
+    // 11. Dedicated price refresh task.
+    //     The scanner's adaptive interval can reach 60s when all target positions are
+    //     deeply in-the-money (best_closeness = 0). This means OUR_PNL% in the Copied
+    //     table would show prices up to 60s stale.
+    //     This task refreshes cur_price in target_positions every 20 seconds,
+    //     completely independent of scanner urgency. It patches ONLY cur_price -- it
+    //     does not re-run classification logic or queue any trade events.
+    {
+        use alloy::primitives::Address;
+        use polymarket_client_sdk::data::types::request::PositionsRequest;
+        use polymarket_client_sdk::data::Client as DataClient;
+        use std::collections::HashMap;
+        use std::str::FromStr;
+
+        let targets = config.target_wallets.clone();
+        let state_pr = state.clone();
+
+        tokio::spawn(async move {
+            let client = DataClient::default();
+            // Small initial delay so scanner runs first and populates target_positions
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            loop {
+                // Fetch fresh prices from each target wallet
+                let mut price_map: HashMap<String, rust_decimal::Decimal> = HashMap::new();
+                for wallet_str in &targets {
+                    let wallet_str = wallet_str.trim();
+                    if let Ok(addr) = Address::from_str(wallet_str) {
+                        let req = PositionsRequest::builder().user(addr).build();
+                        if let Ok(ps) = client.positions(&req).await {
+                            for p in ps {
+                                price_map.insert(p.asset.to_string(), p.cur_price);
+                            }
+                        }
+                    }
+                }
+
+                if !price_map.is_empty() {
+                    let mut g = state_pr.write().await;
+                    for tp in g.target_positions.iter_mut() {
+                        if let Some(&fresh_price) = price_map.get(&tp.token_id) {
+                            tp.cur_price = fresh_price;
+                        }
+                    }
+                    g.last_price_refresh_at = Some(std::time::Instant::now());
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+            }
+        });
+    }
+
+    // 12. Poll live USDC balance every 10 seconds and update TUI
+
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -107,8 +172,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 8. Start Terminal UI (Blocks main thread)
-    ui::start_tui(state.clone(), config.clone()).await?;
+    // 11. Start Terminal UI (blocks main thread).
+    //     Returns TuiExit::Settings when [s] is pressed, causing us to
+    //     re-run the config wizard and restart the bot.
+    match ui::start_tui(state.clone(), config.clone(), log_buffer.clone()).await? {
+        ui::TuiExit::Quit => {}
+        ui::TuiExit::Settings => {
+            // Re-run the wizard; the new .env is written by load_or_prompt.
+            // Then restart the process in-place so the new config is loaded.
+            drop(config::Config::load_or_prompt().await?);
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().collect();
+            let _ = std::process::Command::new(&exe).args(&args[1..]).status();
+        }
+    }
 
     Ok(())
 }

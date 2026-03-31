@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 jobs:
-  # ── Derive version ─────────────────────────────────────────────────────────
+  # -- Derive version ---------------------------------------------------------
   version:
     name: Derive version
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
             if [[ -z "$LATEST" ]]; then
               TAG="v0.1.0"
             else
-              # Bump patch: v1.2.3 → v1.2.4
+              # Bump patch: v1.2.3 -> v1.2.4
               IFS='.' read -r major minor patch <<< "${LATEST#v}"
               TAG="v${major}.${minor}.$((patch + 1))"
             fi
@@ -59,9 +59,9 @@ jobs:
           git tag -a "$TAG" -m "Auto-release $TAG from main"
           git push origin "$TAG"
 
-  # ── Build matrix ────────────────────────────────────────────────────────────
+  # -- Build matrix -----------------------------------------------------------
   build:
-    name: Build — ${{ matrix.target }}
+    name: Build - ${{ matrix.target }}
     needs: version
     runs-on: ${{ matrix.os }}
 
@@ -115,7 +115,7 @@ jobs:
           path: ${{ matrix.artifact }}
           retention-days: 1
 
-  # ── Create GitHub Release ───────────────────────────────────────────────────
+  # -- Create GitHub Release --------------------------------------------------
   release:
     name: Create Release
     needs: [version, build]

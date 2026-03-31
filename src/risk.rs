@@ -23,7 +23,7 @@ impl RiskEngine {
 
         // Cap: don't mirror trades larger than our configured max position size
         if trade_value > self.config.max_trade_size_usd {
-            // We'll scale it down in strategy.rs — just warn, don't reject
+            // We'll scale it down in strategy.rs - just warn, don't reject
         }
 
         Ok(())

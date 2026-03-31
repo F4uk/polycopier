@@ -47,7 +47,7 @@ pub async fn build_order_submitter(config: &Config) -> Result<(OrderSubmitter, B
             let resp = clob
                 .balance_allowance(BalanceAllowanceRequest::default())
                 .await?;
-            // balance is returned in micro-USDC (6 decimal places) — convert to USDC
+            // balance is returned in micro-USDC (6 decimal places) - convert to USDC
             Ok(resp.balance / Decimal::from(1_000_000))
         })
     });

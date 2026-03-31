@@ -1,6 +1,7 @@
 use crate::models::{EvaluatedTrade, Position, TargetPosition};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 pub struct BotState {
     pub positions: HashMap<String, Position>,
@@ -12,6 +13,22 @@ pub struct BotState {
     pub target_positions: Vec<TargetPosition>,
     pub copies_executed: u32,
     pub trades_skipped: u32,
+    /// Estimated total invested capital of the target wallet(s).
+    /// Computed each scan cycle as sum((avg_price * size) across all target open positions.
+    /// Used by `SizingMode::TargetPct` to compute proportional order sizes.
+    pub target_portfolio_usd: Decimal,
+    /// Number of positions WE currently hold that the TARGET also holds.
+    /// Set by a dedicated background task that queries both wallets via the API
+    /// every 30 seconds -- never inferred from local scanner state.
+    pub copied_count: usize,
+    /// When the position scanner last completed a full cycle (wall clock).
+    /// None until the first scan finishes.
+    pub last_scan_at: Option<Instant>,
+    /// How many seconds until the next scan is scheduled (set just before sleeping).
+    pub next_scan_secs: u64,
+    /// When target_positions.cur_price was last refreshed via the dedicated price
+    /// refresh task (runs every 20s, independent of scanner urgency).
+    pub last_price_refresh_at: Option<Instant>,
 }
 
 impl BotState {
@@ -26,6 +43,11 @@ impl BotState {
             target_positions: Vec::new(),
             copies_executed: 0,
             trades_skipped: 0,
+            target_portfolio_usd: Decimal::ZERO,
+            copied_count: 0,
+            last_scan_at: None,
+            next_scan_secs: 0,
+            last_price_refresh_at: None,
         }
     }
 

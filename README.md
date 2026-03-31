@@ -24,16 +24,16 @@ their trades into your own account in real time.
 
 **Two independent signal sources feed the same execution engine:**
 
-1. **Real-time listener** — polls the Data API every 2 seconds and copies new fills the
+1. **Real-time listener** - polls the Data API every 2 seconds and copies new fills the
    moment they appear, using transaction-hash deduplication to handle burst activity.
 
-2. **Adaptive position scanner** — scans the target's full open-position portfolio and
+2. **Adaptive position scanner** - scans the target's full open-position portfolio and
    evaluates catch-up entries (positions the target had open before the bot started).
    Scan frequency adapts dynamically between 10 and 60 seconds based on how close each
-   target position's current price is to their original entry — scanning most aggressively
+   target position's current price is to their original entry - scanning most aggressively
    when a catch-up entry is still at a favorable price.
 
-**Trade intent classification** — the bot tracks the target's current positions (via the
+**Trade intent classification** - the bot tracks the target's current positions (via the
 scanner data) and uses them to classify every event before acting:
 
 | Target has position? | Event | Bot has position? | Intent | Action |
@@ -54,15 +54,15 @@ The entire interface is a terminal UI (TUI) with no browser required.
 
 ## Features
 
-- **Real-time trade copying** — polls the Polymarket Data API every 2 seconds with a
+- **Real-time trade copying** - polls the Polymarket Data API every 2 seconds with a
   rate limit of 20 fills per cycle. Deduplicates by transaction hash (not timestamp) so
   burst activity is never silently dropped.
 
-- **Adaptive open-position scanner** — catches positions the target opened before the bot
+- **Adaptive open-position scanner** - catches positions the target opened before the bot
   started. Scan interval scales from 10s (target position still at entry price) to 60s
   (price has moved significantly or no enterable positions exist).
 
-- **Intent classification** — every incoming BUY and SELL is checked against the target's
+- **Intent classification** - every incoming BUY and SELL is checked against the target's
   last-known positions to determine true intent (fresh entry, adding to long, closing long,
   closing short). Short entries and short closures by the target are correctly skipped.
 
@@ -71,23 +71,43 @@ The entire interface is a terminal UI (TUI) with no browser required.
   - SELL quantities are based on **our own held size**, not the target's order size.
   - SELL is never submitted for a token we don't hold.
 
-- **BUY floor** — entry size targets a minimum of $1.10 notional to prevent rounding errors
+- **BUY floor** - entry size targets a minimum of $1.10 notional to prevent rounding errors
   from dropping below the CLOB's $1.00 minimum order size.
 
-- **Interactive setup wizard** — prompts for all credentials on first run and saves to `.env`.
+- **Interactive setup wizard** - prompts for all credentials on first run and saves to `.env`.
 
-- **Live balance tracking** — CLOB balance polled every 10 seconds.
+- **Live balance tracking** - CLOB balance polled every 10 seconds.
 
-- **Risk engine** — per-trade minimum notional ($1.00), per-trade size cap, and
+- **Four-mode proportional sizing** - choose how each trade is sized:
+
+  | Mode | Formula | When to use |
+  |---|---|---|
+  | `target_pct` (default) | `(target_notional / target_portfolio) * our_balance` | Mirror the target's risk proportion |
+  | `target_usd` | `target_size * target_price` | Mirror the target's exact dollar bet |
+  | `self_pct` | `our_balance * COPY_SIZE_PCT` | Fixed % of our own balance per trade |
+  | `fixed` | Always `MAX_TRADE_SIZE_USD` | Simple deterministic size |
+
+  All modes enforce a $5.00 CLOB minimum and `MAX_TRADE_SIZE_USD` ceiling.
+
+- **Risk engine** - per-trade minimum notional ($5.00 CLOB floor), per-trade size cap (`MAX_TRADE_SIZE_USD`), and
   per-position drawdown filter (`MAX_COPY_LOSS_PCT`).
 
-- **Terminal UI** — four-panel ratatui interface:
-  - Account dashboard (balance, PnL, copy stats)
+- **Terminal UI** - five-panel ratatui interface:
+  - Account dashboard (balance, PnL, **API-sourced Copied counter**)
   - Live copy feed (pass/fail, skip reason per event)
   - Your open positions
   - Opportunity scanner table (color-coded by status)
+  - **Settings panel** (live config summary, `[s]` to open wizard)
+  - **System Logs panel** (WARN+ captured in-memory, never corrupts the TUI)
 
-- **Pre-commit quality gates** — `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
+- **In-TUI settings** - press `[s]` to exit the TUI, run the interactive wizard,
+  save a new `.env`, and restart with the updated configuration.
+
+- **API-accurate Copied counter** - a dedicated background task queries your wallet
+  and each target wallet directly via the API every 30 seconds and computes the
+  intersection. Never based on session state or scanner timing.
+
+- **Pre-commit quality gates** - `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
   run automatically before every commit via `.githooks/pre-commit`.
 
 ---
@@ -132,9 +152,11 @@ cargo run --release
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PRIVATE_KEY` | Yes | — | Hex private key for the signing wallet (`0x…` or plain hex) |
-| `FUNDER_ADDRESS` | Yes | — | Proxy/Safe wallet address that holds USDC (shown on your Polymarket profile) |
-| `TARGET_WALLETS` | Yes | — | Comma-separated list of target proxy wallet addresses to copy |
+| `PRIVATE_KEY` | Yes | - | Hex private key for the signing wallet (`0x...` or plain hex) |
+| `FUNDER_ADDRESS` | Yes | - | Proxy/Safe wallet address that holds USDC (shown on your Polymarket profile) |
+| `TARGET_WALLETS` | Yes | - | Comma-separated list of target proxy wallet addresses to copy |
+| `SIZING_MODE` | No | `target_pct` | Sizing strategy: `target_pct`, `target_usd`, `self_pct`, or `fixed` |
+| `COPY_SIZE_PCT` | No | - | Fraction of our balance per trade (only used when `SIZING_MODE=self_pct`, e.g. `0.05` = 5%) |
 | `MAX_SLIPPAGE_PCT` | No | `0.02` | Maximum allowed price deviation from the copied trade (2% = `0.02`) |
 | `MAX_TRADE_SIZE_USD` | No | `10.00` | Maximum USDC to spend per copied trade |
 | `MAX_DELAY_SECONDS` | No | `10` | Discard live trade events (listener) older than this many seconds |
@@ -167,14 +189,18 @@ On first run with an empty or placeholder `.env`, the setup wizard prompts for:
 1. Private key (hidden input)
 2. Funder address
 3. Target wallet addresses
-4. Slippage, trade size, delay, and loss-threshold limits
+4. Sizing mode (menu: `target_pct` / `target_usd` / `self_pct` / `fixed`)
+5. `COPY_SIZE_PCT` only if `self_pct` was chosen
+6. Slippage, trade size, delay, and loss-threshold limits
 
 All values are saved to `.env` and reused on subsequent runs.
+Press **`[s]`** inside the TUI at any time to re-run the wizard and update settings.
 
 ### Logging
 
-By default the bot suppresses all log output below `WARN` level to keep the TUI clean.
-To see verbose diagnostic output:
+WARN+ messages are captured in the **System Logs** panel inside the TUI.
+No log lines are printed to the terminal while the TUI is active.
+To see verbose diagnostic output in a non-TUI context:
 
 ```bash
 RUST_LOG=debug cargo run --release
@@ -185,6 +211,7 @@ RUST_LOG=debug cargo run --release
 | Key | Action |
 |---|---|
 | `q` | Quit |
+| `s` | Open settings wizard (exits TUI, runs wizard, restarts bot) |
 
 ---
 
@@ -193,26 +220,32 @@ RUST_LOG=debug cargo run --release
 ```
 main.rs
   |
-  +-- config.rs          Load .env / interactive wizard
+  +-- config.rs           Load .env / interactive wizard
   |
-  +-- clients.rs         CLOB authentication + order submission + balance fetcher
+  +-- clients.rs          CLOB authentication + order submission + balance fetcher
   |
-  +-- listener.rs        Data API polling loop (2s, hash-dedup) -> TradeEvent channel
+  +-- listener.rs         Data API polling loop (2s, hash-dedup) -> TradeEvent channel
   |
-  +-- position_scanner.rs  Catch-up scanner (adaptive 10–60s) -> TradeEvent channel
+  +-- position_scanner.rs Catch-up scanner (adaptive 10-60s) -> TradeEvent channel
   |
-  +-- strategy.rs        Receives TradeEvents, classifies intent, applies risk checks,
-  |                       submits orders via OrderSubmitter
+  +-- copied_counter.rs   API-based Copied counter (our wallet x target wallets, 30s)
   |
-  +-- risk.rs            RiskEngine: minimum notional, max size enforcement
+  +-- strategy.rs         Receives TradeEvents, classifies intent, applies risk checks,
+  |                        submits orders via OrderSubmitter
   |
-  +-- state.rs           Shared BotState (Arc<RwLock<_>>): balance, our positions,
-  |                       target positions, live feed, TUI counters
+  +-- risk.rs             RiskEngine: minimum notional, max size enforcement
   |
-  +-- ui.rs              ratatui TUI: dashboard, live feed, positions, opportunity scanner
+  +-- state.rs            Shared BotState (Arc<RwLock<_>>): balance, our positions,
+  |                        target positions, live feed, TUI counters
   |
-  +-- models.rs          Core types: TradeEvent, EvaluatedTrade, TargetPosition, ScanStatus
-  +-- utils.rs           Timestamp formatting helpers
+  +-- ui.rs               ratatui TUI: dashboard, live feed, positions, scanner,
+  |                        settings panel, system logs panel
+  |
+  +-- log_capture.rs      TuiLogLayer: captures WARN+ to in-memory ring buffer
+  |
+  +-- models.rs           Core types: TradeEvent, EvaluatedTrade, TargetPosition,
+  |                        ScanStatus, SizingMode
+  +-- utils.rs            Timestamp formatting helpers
 ```
 
 ### Data Flow
@@ -222,7 +255,7 @@ Polymarket Data API
     |
     +-- listener (2s poll, limit 20, hash-dedup) -----> mpsc::Sender<TradeEvent>
     |                                                              |
-    +-- position_scanner (adaptive 10–60s poll) -----> mpsc::Sender<TradeEvent> (cloned)
+    +-- position_scanner (adaptive 10-60s poll) -----> mpsc::Sender<TradeEvent> (cloned)
                                                                    |
                                                          strategy engine
                                                            - wallet filter
@@ -242,10 +275,10 @@ Polymarket Data API
 The scanner fetches the target's full open portfolio and evaluates each position in order.
 A position is skipped at the first failing guard:
 
-1. **Already held** — the bot already holds this token (`SkippedOwned`)
-2. **Already queued** — an entry order was sent this session (`Entered`)
-3. **Price range** — current price must be between `$0.02` and `$0.95` (`SkippedPrice`)
-4. **Loss threshold** — the target's unrealized loss must be less than `MAX_COPY_LOSS_PCT` (`SkippedLoss`)
+1. **Already held** - the bot already holds this token (`SkippedOwned`)
+2. **Already queued** - an entry order was sent this session (`Entered`)
+3. **Price range** - current price must be between `$0.02` and `$0.95` (`SkippedPrice`)
+4. **Loss threshold** - the target's unrealized loss must be less than `MAX_COPY_LOSS_PCT` (`SkippedLoss`)
 
 Positions passing all guards are classified as `Monitoring` (green in TUI) and an entry is queued.
 
@@ -256,9 +289,9 @@ The scanner reschedules itself after each cycle based on the best available oppo
 | Target position state | Scan interval |
 |---|---|
 | Price exactly at target's entry (0% PnL) | 10s |
-| Small move (±5%) | ~27s |
-| Moderate move (±10%) | ~43s |
-| Large move (±15%+) — would be chasing | 60s |
+| Small move (+/-5%) | ~27s |
+| Moderate move (+/-10%) | ~43s |
+| Large move (+/-15%+) - would be chasing | 60s |
 | No enterable (Monitoring) positions | 60s |
 | Position past `MAX_COPY_LOSS_PCT` | 60s (filtered out) |
 
@@ -270,7 +303,7 @@ The scanner reschedules itself after each cycle based on the best available oppo
 # Run with live reloading (requires cargo-watch)
 cargo watch -x run
 
-# Run the full test suite (82 tests, all pure/unit — no network)
+# Run the full test suite (127 tests, all pure/unit - no network)
 cargo test --all
 
 # Lint
@@ -279,6 +312,14 @@ cargo clippy --all-targets -- -D warnings
 # Format
 cargo fmt
 ```
+
+### Test layout
+
+| File | What it covers |
+|---|---|
+| `tests/integration.rs` | Strategy engine: intent classification, risk guards, SELL guards, slippage, deduplication |
+| `tests/sizing_tests.rs` | `compute_order_usd` for all four sizing modes + floor/cap guards |
+| `tests/copied_counter_tests.rs` | `count_intersection` pure function: empty, full, partial, no overlap, multi-target |
 
 The pre-commit hook runs fmt + clippy + tests automatically. To install it:
 
@@ -291,7 +332,7 @@ git config core.hooksPath .githooks
 ## Security Notes
 
 - Your private key is used locally to sign EIP-712 order hashes. It is never transmitted
-  to any server — only the resulting signature is sent to the CLOB API.
+  to any server - only the resulting signature is sent to the CLOB API.
 - The `.env` file is excluded from version control by `.gitignore`. Treat it like a password.
 - Review `src/risk.rs` and configure appropriate limits before running with significant capital.
 - This software is provided as-is. You are solely responsible for any trades it executes.
@@ -300,15 +341,18 @@ git config core.hooksPath .githooks
 
 ## Releases
 
-Releases are created automatically by GitHub Actions whenever a version tag is pushed.
-The workflow builds binaries for macOS (Apple Silicon), macOS (Intel), and Linux, then
-publishes a GitHub Release with the compiled artifacts attached.
+Releases are created automatically by GitHub Actions.
 
-To cut a release:
+**On every merge to `main`:** the CI workflow auto-bumps the patch version of the
+latest semver tag (e.g. `v0.1.0` -> `v0.1.1`), creates an annotated tag, builds
+binaries for macOS (Apple Silicon), macOS (Intel), and Linux, and publishes a
+GitHub Release with the artifacts attached.
+
+**Manual release:** push any `v*` tag directly:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Pre-release versions (e.g. `v0.2.0-beta`) are automatically marked as pre-release on GitHub.
