@@ -1,6 +1,7 @@
 pub mod clients;
 /// polycopier - library crate exposing all modules for integration testing and downstream use.
 pub mod config;
+pub mod copied_counter;
 pub mod listener;
 pub mod log_capture;
 pub mod models;
