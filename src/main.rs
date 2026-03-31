@@ -178,13 +178,9 @@ async fn main() -> anyhow::Result<()> {
     match ui::start_tui(state.clone(), config.clone(), log_buffer.clone()).await? {
         ui::TuiExit::Quit => {}
         ui::TuiExit::Settings => {
-            // Re-run the wizard; the new .env is written by load_or_prompt.
-            drop(config::Config::load_or_prompt().await?);
-
-            // Replace the current process entirely (execv) so that:
-            //   - All background tasks (scanner, listener, etc.) are gone.
-            //   - No duplicate bots fight over the same terminal.
-            //   - The new process starts fresh with the updated .env.
+            // Settings were already saved to .env inside the TUI before this
+            // exit was triggered. Replace this process with a fresh instance
+            // so it starts cleanly with the new config.
             let exe = std::env::current_exe()?;
             let args: Vec<String> = std::env::args().collect();
 
@@ -197,7 +193,6 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(not(unix))]
             {
-                // Fallback for non-Unix: spawn child, then exit this process.
                 let _ = std::process::Command::new(&exe).args(&args[1..]).spawn();
                 std::process::exit(0);
             }

@@ -5,7 +5,7 @@ use crate::state::BotState;
 use crate::utils;
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -27,8 +27,228 @@ use tokio::sync::RwLock;
 pub enum TuiExit {
     /// User pressed [q] -- shut down.
     Quit,
-    /// User pressed [s] -- run settings wizard then restart.
+    /// Settings were saved inside the TUI. Main should execv to restart.
     Settings,
+}
+
+// -- In-TUI settings editor ---------------------------------------------------
+struct SettingsField {
+    label: &'static str,
+    env_key: &'static str,
+    value: String,
+    original: String,
+    hint: &'static str,
+    secret: bool,
+}
+
+impl SettingsField {
+    fn new(
+        label: &'static str,
+        env_key: &'static str,
+        default: &'static str,
+        hint: &'static str,
+        secret: bool,
+    ) -> Self {
+        let raw = std::env::var(env_key).unwrap_or_else(|_| default.to_string());
+        // Strip surrounding quotes added by dotenv file format
+        let value = raw.trim().trim_matches('"').to_string();
+        Self {
+            label,
+            env_key,
+            value: value.clone(),
+            original: value,
+            hint,
+            secret,
+        }
+    }
+    fn is_changed(&self) -> bool {
+        self.value != self.original
+    }
+    fn display(&self, editing: bool, buf: &str) -> String {
+        if editing {
+            format!("{}_", buf)
+        } else if self.secret && !self.value.is_empty() {
+            "[hidden]".to_string()
+        } else {
+            self.value.clone()
+        }
+    }
+}
+
+struct SettingsScreen {
+    fields: Vec<SettingsField>,
+    selected: usize,
+    editing: bool,
+    edit_buf: String,
+    status: String,
+}
+
+enum SettingsExit {
+    Back,
+    SaveAndRestart,
+}
+
+impl SettingsScreen {
+    fn new() -> Self {
+        let fields = vec![
+            SettingsField::new(
+                "Target Wallets",
+                "TARGET_WALLETS",
+                "",
+                "Comma-separated proxy wallet addresses to copy-trade",
+                false,
+            ),
+            SettingsField::new(
+                "Max Trade Size (USD)",
+                "MAX_TRADE_SIZE_USD",
+                "10.00",
+                "Hard ceiling per copied trade regardless of sizing mode",
+                false,
+            ),
+            SettingsField::new(
+                "Max Slippage",
+                "MAX_SLIPPAGE_PCT",
+                "0.02",
+                "Price deviation allowed from copied trade  (0.02 = 2%)",
+                false,
+            ),
+            SettingsField::new(
+                "Max Event Age (secs)",
+                "MAX_DELAY_SECONDS",
+                "2",
+                "Drop live events older than N seconds",
+                false,
+            ),
+            SettingsField::new(
+                "Max Copy Loss",
+                "MAX_COPY_LOSS_PCT",
+                "0.40",
+                "Skip catch-up if target already this % underwater  (0.40 = 40%)",
+                false,
+            ),
+            SettingsField::new(
+                "Min Entry Price",
+                "MIN_ENTRY_PRICE",
+                "0.02",
+                "Minimum token price for catch-up entries",
+                false,
+            ),
+            SettingsField::new(
+                "Max Entry Price",
+                "MAX_ENTRY_PRICE",
+                "0.999",
+                "Maximum token price for catch-up entries",
+                false,
+            ),
+            SettingsField::new(
+                "Sizing Mode",
+                "SIZING_MODE",
+                "target_pct",
+                "fixed | self_pct | target_usd | target_pct",
+                false,
+            ),
+            SettingsField::new(
+                "Copy Size %",
+                "COPY_SIZE_PCT",
+                "",
+                "Only used for self_pct mode  (0.10 = 10%)",
+                false,
+            ),
+        ];
+        Self {
+            fields,
+            selected: 0,
+            editing: false,
+            edit_buf: String::new(),
+            status: "  Arrow keys: navigate   Enter: edit   [s]: Save & Restart   [q]: Back without saving".into(),
+        }
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) -> Option<SettingsExit> {
+        if self.editing {
+            match k.code {
+                KeyCode::Esc => {
+                    self.editing = false;
+                    self.status = format!(
+                        "  Cancelled -- '{}' unchanged",
+                        self.fields[self.selected].label
+                    );
+                }
+                KeyCode::Enter => {
+                    let label = self.fields[self.selected].label;
+                    self.fields[self.selected].value = self.edit_buf.trim().to_string();
+                    self.editing = false;
+                    self.status =
+                        format!("  '{}' updated -- [s] to Save & Restart  [q] Back", label);
+                }
+                KeyCode::Backspace => {
+                    self.edit_buf.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.edit_buf.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selected = self.selected.saturating_sub(1);
+                    self.status = format!("  {}   |   Arrow keys: navigate   Enter: edit   [s]: Save & Restart   [q]: Back",
+                        self.fields[self.selected].hint);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.selected = (self.selected + 1).min(self.fields.len() - 1);
+                    self.status = format!("  {}   |   Arrow keys: navigate   Enter: edit   [s]: Save & Restart   [q]: Back",
+                        self.fields[self.selected].hint);
+                }
+                KeyCode::Enter => {
+                    self.edit_buf = self.fields[self.selected].value.clone();
+                    self.editing = true;
+                    self.status = format!(
+                        "  Editing '{}'  -- Enter to confirm  Esc to cancel",
+                        self.fields[self.selected].label
+                    );
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    return Some(SettingsExit::SaveAndRestart);
+                }
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                    return Some(SettingsExit::Back);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn save_to_dotenv(&self) -> anyhow::Result<()> {
+        self.save_to_path(std::path::Path::new(".env"))
+    }
+
+    /// Testable variant -- writes to an arbitrary path instead of ".env".
+    fn save_to_path(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let pk = std::env::var("PRIVATE_KEY").unwrap_or_default();
+        let fa = std::env::var("FUNDER_ADDRESS").unwrap_or_default();
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        writeln!(f, "PRIVATE_KEY=\"{}\"", pk.trim().trim_matches('"'))?;
+        writeln!(f, "FUNDER_ADDRESS=\"{}\"", fa.trim().trim_matches('"'))?;
+        for field in &self.fields {
+            if !field.value.is_empty() {
+                writeln!(f, "{}=\"{}\"", field.env_key, field.value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn has_changes(&self) -> bool {
+        self.fields.iter().any(|f| f.is_changed())
+    }
 }
 
 // -- Snapshot cloned out of the RwLock each frame ------------------------------
@@ -86,60 +306,86 @@ pub async fn start_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // -- Screen state: either the live dashboard or the in-TUI settings editor --
+    enum Screen {
+        Dashboard,
+        Settings(SettingsScreen),
+    }
+    let mut screen = Screen::Dashboard;
+
     let exit = loop {
-        // -- Snapshot state (brief read lock) ----------------------------------
-        let snap = {
-            let g = state.read().await;
-
-            // Grab the last LOG_PANEL_LINES log entries from the buffer
-            let logs = {
-                if let Ok(buf) = log_buffer.try_lock() {
-                    buf.iter()
-                        .rev()
-                        .take(LOG_PANEL_LINES)
-                        .map(|e| (e.timestamp.clone(), e.level.clone(), e.message.clone()))
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect()
-                } else {
-                    vec![]
-                }
-            };
-
-            Snap {
-                balance: g.total_balance,
-                realized_pnl: g.realized_pnl,
-                unrealized_pnl: g.unrealized_pnl,
-                feed: g.live_feed.iter().take(20).cloned().collect(),
-                positions: g.positions.values().cloned().collect(),
-                target_positions: g.target_positions.clone(),
-                target_portfolio_est: if config.sizing_mode == crate::models::SizingMode::TargetPct
-                {
-                    Some(g.target_portfolio_usd)
-                } else {
-                    None
-                },
-                // Authoritative count from the dedicated API task (main.rs).
-                // Queries our wallet and each target wallet every 30s.
-                copied_count: g.copied_count,
-                skips: g.trades_skipped,
-                logs,
-                last_scan_secs_ago: g.last_scan_at.map(|t| t.elapsed().as_secs()),
-                next_scan_secs: g.next_scan_secs,
-                last_price_refresh_secs_ago: g.last_price_refresh_at.map(|t| t.elapsed().as_secs()),
-            }
-        };
-
-        terminal.draw(|f| render(f, &snap, &config))?;
-
+        // -- Handle events first (needs &mut screen) ---------------------------
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(k) = event::read()? {
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => break TuiExit::Quit,
-                    KeyCode::Char('s') | KeyCode::Char('S') => break TuiExit::Settings,
-                    _ => {}
+                match &mut screen {
+                    Screen::Dashboard => match k.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => break TuiExit::Quit,
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            screen = Screen::Settings(SettingsScreen::new());
+                        }
+                        _ => {}
+                    },
+                    Screen::Settings(s) => match s.handle_key(k) {
+                        Some(SettingsExit::Back) => {
+                            screen = Screen::Dashboard;
+                        }
+                        Some(SettingsExit::SaveAndRestart) => match s.save_to_dotenv() {
+                            Ok(()) => break TuiExit::Settings,
+                            Err(e) => {
+                                s.status = format!("  Save failed: {}  -- press [q] to go back", e);
+                            }
+                        },
+                        None => {}
+                    },
                 }
+            }
+        }
+
+        // -- Draw (needs &screen immutably) ------------------------------------
+        match &screen {
+            Screen::Dashboard => {
+                let snap = {
+                    let g = state.read().await;
+                    let logs = if let Ok(buf) = log_buffer.try_lock() {
+                        buf.iter()
+                            .rev()
+                            .take(LOG_PANEL_LINES)
+                            .map(|e| (e.timestamp.clone(), e.level.clone(), e.message.clone()))
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    Snap {
+                        balance: g.total_balance,
+                        realized_pnl: g.realized_pnl,
+                        unrealized_pnl: g.unrealized_pnl,
+                        feed: g.live_feed.iter().take(20).cloned().collect(),
+                        positions: g.positions.values().cloned().collect(),
+                        target_positions: g.target_positions.clone(),
+                        target_portfolio_est: if config.sizing_mode
+                            == crate::models::SizingMode::TargetPct
+                        {
+                            Some(g.target_portfolio_usd)
+                        } else {
+                            None
+                        },
+                        copied_count: g.copied_count,
+                        skips: g.trades_skipped,
+                        logs,
+                        last_scan_secs_ago: g.last_scan_at.map(|t| t.elapsed().as_secs()),
+                        next_scan_secs: g.next_scan_secs,
+                        last_price_refresh_secs_ago: g
+                            .last_price_refresh_at
+                            .map(|t| t.elapsed().as_secs()),
+                    }
+                };
+                terminal.draw(|f| render(f, &snap, &config))?;
+            }
+            Screen::Settings(s) => {
+                terminal.draw(|f| render_settings_editor(f, s))?;
             }
         }
     };
@@ -756,4 +1002,468 @@ fn render_footer(f: &mut Frame, area: ratatui::layout::Rect) {
     ]))
     .alignment(Alignment::Left);
     f.render_widget(footer, area);
+}
+
+// -- In-TUI settings editor screen --------------------------------------------
+fn render_settings_editor(f: &mut Frame, screen: &SettingsScreen) {
+    let area = f.size();
+
+    // Outer layout: title block | fields table | status bar
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // fields
+            Constraint::Length(3), // status + hints
+        ])
+        .split(area);
+
+    // -- Outer border with title -----------------------------------------------
+    let block = Block::default()
+        .title(Span::styled(
+            " [S] Settings   [Enter] Edit field   [s] Save & Restart   [q] Back ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner_fields = block.inner(outer[0]);
+    f.render_widget(block, outer[0]);
+
+    // -- Fields table ----------------------------------------------------------
+    let header = Row::new(vec![
+        Cell::from("  Field").style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Cell::from("Current Value").style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Cell::from("").style(Style::default()), // changed marker column
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = screen
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let is_sel = i == screen.selected;
+            let is_edit = is_sel && screen.editing;
+
+            let label = Cell::from(format!("  {}", field.label))
+                .style(Style::default().fg(if is_sel { Color::Yellow } else { Color::White }));
+
+            let val_str = field.display(is_edit, &screen.edit_buf);
+            let val = Cell::from(format!(" {}", val_str)).style(if is_edit {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_sel {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            });
+
+            let changed = Cell::from(if field.is_changed() { " *" } else { "" })
+                .style(Style::default().fg(Color::Yellow));
+
+            let row_style = if is_sel && !is_edit {
+                Style::default().bg(Color::Rgb(40, 40, 60))
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![label, val, changed])
+                .style(row_style)
+                .height(1)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        &[
+            Constraint::Length(26),
+            Constraint::Min(30),
+            Constraint::Length(3),
+        ],
+    )
+    .header(header);
+
+    f.render_widget(table, inner_fields);
+
+    // -- Status / hint bar -----------------------------------------------------
+    let dirty_note = if screen.has_changes() && !screen.editing {
+        "  [*] Unsaved changes  -- press [s] to Save & Restart"
+    } else {
+        ""
+    };
+
+    let status_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let status_inner = status_block.inner(outer[1]);
+    f.render_widget(status_block, outer[1]);
+
+    let status_text = if dirty_note.is_empty() {
+        screen.status.as_str()
+    } else {
+        dirty_note
+    };
+
+    f.render_widget(
+        Paragraph::new(status_text).style(Style::default().fg(Color::Gray)),
+        status_inner,
+    );
+}
+
+// =============================================================================
+// Unit tests for SettingsField / SettingsScreen pure logic
+// (no terminal, no async required)
+// =============================================================================
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // -- helpers to build minimal SettingsField without touching env -----------
+    fn field(label: &'static str, value: &str) -> SettingsField {
+        SettingsField {
+            label,
+            env_key: "DUMMY",
+            value: value.to_string(),
+            original: value.to_string(),
+            hint: "hint",
+            secret: false,
+        }
+    }
+
+    fn secret_field(value: &str) -> SettingsField {
+        SettingsField {
+            label: "Key",
+            env_key: "DUMMY",
+            value: value.to_string(),
+            original: value.to_string(),
+            hint: "secret hint",
+            secret: true,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SettingsField
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn field_not_changed_initially() {
+        let f = field("Trade Size", "10.00");
+        assert!(!f.is_changed());
+    }
+
+    #[test]
+    fn field_changed_after_mutation() {
+        let mut f = field("Trade Size", "10.00");
+        f.value = "25.00".into();
+        assert!(f.is_changed());
+    }
+
+    #[test]
+    fn field_not_changed_when_reset_to_original() {
+        let mut f = field("Slippage", "0.02");
+        f.value = "0.05".into();
+        f.value = "0.02".into();
+        assert!(!f.is_changed());
+    }
+
+    #[test]
+    fn field_display_normal_not_editing() {
+        let f = field("Size", "10.00");
+        assert_eq!(f.display(false, ""), "10.00");
+    }
+
+    #[test]
+    fn field_display_editing_shows_buf_with_underscore() {
+        let f = field("Size", "10.00");
+        assert_eq!(f.display(true, "25.0"), "25.0_");
+    }
+
+    #[test]
+    fn field_display_secret_not_editing_shows_hidden() {
+        let f = secret_field("mysecretkey");
+        assert_eq!(f.display(false, ""), "[hidden]");
+    }
+
+    #[test]
+    fn field_display_secret_editing_shows_buf() {
+        // When editing a secret field the buffer is shown (user is typing)
+        let f = secret_field("old");
+        assert_eq!(f.display(true, "newkey"), "newkey_");
+    }
+
+    #[test]
+    fn field_new_strips_surrounding_quotes() {
+        // Simulate an env var like PRIVATE_KEY="abc" stored as `"abc"` in .env
+        std::env::set_var("_TEST_QUOTED", "\"hello\"");
+        let f = SettingsField::new("lbl", "_TEST_QUOTED", "", "hint", false);
+        assert_eq!(f.value, "hello");
+        std::env::remove_var("_TEST_QUOTED");
+    }
+
+    #[test]
+    fn field_new_uses_default_when_env_missing() {
+        std::env::remove_var("_TEST_MISSING_FIELD");
+        let f = SettingsField::new("lbl", "_TEST_MISSING_FIELD", "default_val", "hint", false);
+        assert_eq!(f.value, "default_val");
+    }
+
+    // -------------------------------------------------------------------------
+    // SettingsScreen -- construction
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn screen_starts_at_first_field() {
+        let s = SettingsScreen::new();
+        assert_eq!(s.selected, 0);
+        assert!(!s.editing);
+    }
+
+    #[test]
+    fn screen_has_nine_fields() {
+        let s = SettingsScreen::new();
+        assert_eq!(s.fields.len(), 9);
+    }
+
+    // -------------------------------------------------------------------------
+    // SettingsScreen -- change detection
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn has_changes_false_on_fresh_screen() {
+        let s = SettingsScreen::new();
+        assert!(!s.has_changes());
+    }
+
+    #[test]
+    fn has_changes_true_after_field_mutation() {
+        let mut s = SettingsScreen::new();
+        s.fields[0].value = "changed".into();
+        assert!(s.has_changes());
+    }
+
+    // -------------------------------------------------------------------------
+    // SettingsScreen -- key navigation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn down_key_moves_selection() {
+        let mut s = SettingsScreen::new();
+        assert_eq!(s.selected, 0);
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected, 1);
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected, 2);
+    }
+
+    #[test]
+    fn up_key_does_not_underflow() {
+        let mut s = SettingsScreen::new();
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.selected, 0); // stays at 0
+    }
+
+    #[test]
+    fn down_key_does_not_overflow_past_last_field() {
+        let mut s = SettingsScreen::new();
+        let last = s.fields.len() - 1;
+        for _ in 0..20 {
+            s.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(s.selected, last);
+    }
+
+    #[test]
+    fn j_and_k_navigate_like_arrows() {
+        let mut s = SettingsScreen::new();
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.selected, 1);
+        s.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(s.selected, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // SettingsScreen -- editing lifecycle
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn enter_starts_editing_with_current_value_in_buf() {
+        let mut s = SettingsScreen::new();
+        let original_val = s.fields[0].value.clone();
+        s.handle_key(key(KeyCode::Enter));
+        assert!(s.editing);
+        assert_eq!(s.edit_buf, original_val);
+    }
+
+    #[test]
+    fn char_input_while_editing_appends_to_buf() {
+        let mut s = SettingsScreen::new();
+        s.handle_key(key(KeyCode::Enter)); // start editing
+        s.handle_key(key(KeyCode::Char('A')));
+        s.handle_key(key(KeyCode::Char('B')));
+        assert!(s.edit_buf.ends_with("AB"));
+    }
+
+    #[test]
+    fn backspace_removes_last_char_from_buf() {
+        let mut s = SettingsScreen::new();
+        s.handle_key(key(KeyCode::Enter)); // start editing
+        s.edit_buf = "hello".into();
+        s.handle_key(key(KeyCode::Backspace));
+        assert_eq!(s.edit_buf, "hell");
+    }
+
+    #[test]
+    fn enter_while_editing_confirms_value() {
+        let mut s = SettingsScreen::new();
+        s.handle_key(key(KeyCode::Enter)); // start editing
+        s.edit_buf = "99.99".into();
+        s.handle_key(key(KeyCode::Enter)); // confirm
+        assert!(!s.editing);
+        assert_eq!(s.fields[0].value, "99.99");
+        assert!(s.fields[0].is_changed() || s.fields[0].value == "99.99");
+    }
+
+    #[test]
+    fn esc_while_editing_cancels_without_saving() {
+        let mut s = SettingsScreen::new();
+        let original = s.fields[0].value.clone();
+        s.handle_key(key(KeyCode::Enter)); // start editing
+        s.edit_buf = "changed".into();
+        s.handle_key(key(KeyCode::Esc)); // cancel
+        assert!(!s.editing);
+        assert_eq!(s.fields[0].value, original); // unchanged
+    }
+
+    #[test]
+    fn q_returns_back_exit() {
+        let mut s = SettingsScreen::new();
+        let result = s.handle_key(key(KeyCode::Char('q')));
+        assert!(matches!(result, Some(SettingsExit::Back)));
+    }
+
+    #[test]
+    fn esc_not_editing_returns_back_exit() {
+        let mut s = SettingsScreen::new();
+        let result = s.handle_key(key(KeyCode::Esc));
+        assert!(matches!(result, Some(SettingsExit::Back)));
+    }
+
+    #[test]
+    fn s_key_returns_save_and_restart_exit() {
+        let mut s = SettingsScreen::new();
+        let result = s.handle_key(key(KeyCode::Char('s')));
+        assert!(matches!(result, Some(SettingsExit::SaveAndRestart)));
+    }
+
+    #[test]
+    fn navigation_keys_return_none() {
+        let mut s = SettingsScreen::new();
+        assert!(s.handle_key(key(KeyCode::Down)).is_none());
+        assert!(s.handle_key(key(KeyCode::Up)).is_none());
+        assert!(s.handle_key(key(KeyCode::Enter)).is_none()); // starts editing
+        assert!(s.handle_key(key(KeyCode::Esc)).is_none()); // cancels editing
+    }
+
+    // -------------------------------------------------------------------------
+    // SettingsScreen::save_to_path -- .env output correctness
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn save_to_path_writes_non_empty_fields() {
+        let tmp = tempfile_path();
+        let mut s = minimal_screen();
+        s.fields[0].value = "0xABC,0xDEF".into(); // TARGET_WALLETS
+        s.fields[1].value = "50.00".into(); // MAX_TRADE_SIZE_USD
+        s.save_to_path(&tmp).expect("save failed");
+
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(content.contains("TARGET_WALLETS=\"0xABC,0xDEF\""));
+        assert!(content.contains("MAX_TRADE_SIZE_USD=\"50.00\""));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn save_to_path_skips_empty_fields() {
+        let tmp = tempfile_path();
+        let mut s = minimal_screen();
+        s.fields[8].value = "".into(); // COPY_SIZE_PCT -- clear it
+        s.save_to_path(&tmp).expect("save failed");
+
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            !content.contains("COPY_SIZE_PCT"),
+            "empty field should not be written"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn save_to_path_preserves_private_key_from_env() {
+        std::env::set_var("PRIVATE_KEY", "\"0xdeadbeef\"");
+        let tmp = tempfile_path();
+        let s = minimal_screen();
+        s.save_to_path(&tmp).expect("save failed");
+
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            content.contains("PRIVATE_KEY=\"0xdeadbeef\""),
+            "PRIVATE_KEY should be preserved from env, got:\n{}",
+            content
+        );
+        let _ = std::fs::remove_file(&tmp);
+        std::env::remove_var("PRIVATE_KEY");
+    }
+
+    // -- helpers ---------------------------------------------------------------
+
+    fn tempfile_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "polycopier_test_{}.env",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ))
+    }
+
+    /// A SettingsScreen whose fields are pre-populated with known values
+    /// (avoids reading from the real .env which may vary).
+    fn minimal_screen() -> SettingsScreen {
+        let mut s = SettingsScreen::new();
+        // Override values to known state regardless of real .env
+        let known = [
+            "0xWallet",
+            "10.00",
+            "0.02",
+            "2",
+            "0.40",
+            "0.02",
+            "0.999",
+            "target_pct",
+            "",
+        ];
+        for (f, v) in s.fields.iter_mut().zip(known.iter()) {
+            f.value = v.to_string();
+            f.original = v.to_string();
+        }
+        s
+    }
 }
