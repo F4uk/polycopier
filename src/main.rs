@@ -17,15 +17,44 @@ use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Set up in-memory log capture so tracing output goes to the TUI log
-    //    panel instead of corrupting the alternate-screen TUI.
-    //    RUST_LOG is still honoured for the level filter.
-    let log_buffer = log_capture::new_log_buffer();
-    let tui_layer = log_capture::TuiLogLayer::new(log_buffer.clone());
-    let level_filter = tracing_subscriber::filter::LevelFilter::WARN;
-    tracing_subscriber::registry()
-        .with(tui_layer.with_filter(level_filter))
-        .init();
+    // ── Detect run mode ───────────────────────────────────────────────────────
+    // --headless   Skip the TUI; log to stdout. Intended for server / systemd.
+    // (default)    Interactive TUI mode for local use.
+    let headless = std::env::args().any(|a| a == "--headless");
+
+    // ── Tracing setup ─────────────────────────────────────────────────────────
+    // TUI mode   : WARN+ captured in-memory and displayed in the log panel.
+    // Headless   : INFO+ written to stdout (picked up by journalctl / Docker).
+    let log_buffer = if headless {
+        // In headless mode we still create a dummy buffer so the type is the
+        // same, but we set up stdout logging via tracing_subscriber::fmt.
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("polycopier=info,warn"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_level(true)
+            .init();
+        log_capture::new_log_buffer() // unused in headless, kept for type unification
+    } else {
+        // 1. Set up in-memory log capture so tracing output goes to the TUI
+        //    log panel instead of corrupting the alternate-screen TUI.
+        let log_buffer = log_capture::new_log_buffer();
+        let tui_layer = log_capture::TuiLogLayer::new(log_buffer.clone());
+        let level_filter = tracing_subscriber::filter::LevelFilter::WARN;
+        tracing_subscriber::registry()
+            .with(tui_layer.with_filter(level_filter))
+            .init();
+        log_buffer
+    };
+
+    if headless {
+        tracing::info!(
+            "polycopier starting in HEADLESS mode (no TUI). \
+             Send SIGTERM or SIGINT (Ctrl-C) to stop."
+        );
+    }
 
     // 2. Load Configuration via Prompt Wizard
     let config = config::Config::load_or_prompt().await?;
@@ -103,13 +132,7 @@ async fn main() -> anyhow::Result<()> {
         30,
     );
 
-    // 11. Dedicated price refresh task.
-    //     The scanner's adaptive interval can reach 60s when all target positions are
-    //     deeply in-the-money (best_closeness = 0). This means OUR_PNL% in the Copied
-    //     table would show prices up to 60s stale.
-    //     This task refreshes cur_price in target_positions every 20 seconds,
-    //     completely independent of scanner urgency. It patches ONLY cur_price -- it
-    //     does not re-run classification logic or queue any trade events.
+    // 11. Dedicated price refresh task (every 20s, independent of scanner urgency).
     {
         use alloy::primitives::Address;
         use polymarket_client_sdk::data::types::request::PositionsRequest;
@@ -122,10 +145,8 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             let client = DataClient::default();
-            // Small initial delay so scanner runs first and populates target_positions
             tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
             loop {
-                // Fetch fresh prices from each target wallet
                 let mut price_map: HashMap<String, rust_decimal::Decimal> = HashMap::new();
                 for wallet_str in &targets {
                     let wallet_str = wallet_str.trim();
@@ -154,8 +175,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 12. Poll live USDC balance every 10 seconds and update TUI
-
+    // 12. Poll live USDC balance every 10 seconds and update state.
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -172,29 +192,49 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 11. Start Terminal UI (blocks main thread).
-    //     Returns TuiExit::Settings when [s] is pressed, causing us to
-    //     re-run the config wizard and restart the bot.
-    match ui::start_tui(state.clone(), config.clone(), log_buffer.clone()).await? {
-        ui::TuiExit::Quit => {}
-        ui::TuiExit::Settings => {
-            // Settings were already saved to .env inside the TUI before this
-            // exit was triggered. Replace this process with a fresh instance
-            // so it starts cleanly with the new config.
-            let exe = std::env::current_exe()?;
-            let args: Vec<String> = std::env::args().collect();
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let err = std::process::Command::new(&exe).args(&args[1..]).exec(); // never returns on success
-                return Err(anyhow::anyhow!("exec failed: {}", err));
+    // ── Main thread: TUI or headless wait ─────────────────────────────────────
+    if headless {
+        // Block until SIGTERM or SIGINT (Ctrl-C). All work happens in spawned tasks.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Received SIGINT -- shutting down.");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM -- shutting down.");
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await?;
+            tracing::info!("Received Ctrl-C -- shutting down.");
+        }
+    } else {
+        // Interactive TUI mode.
+        match ui::start_tui(state.clone(), config.clone(), log_buffer.clone()).await? {
+            ui::TuiExit::Quit => {}
+            ui::TuiExit::Settings => {
+                // Settings were already saved to .env inside the TUI.
+                // Replace this process with a fresh instance.
+                let exe = std::env::current_exe()?;
+                let args: Vec<String> = std::env::args().collect();
 
-            #[cfg(not(unix))]
-            {
-                let _ = std::process::Command::new(&exe).args(&args[1..]).spawn();
-                std::process::exit(0);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let err = std::process::Command::new(&exe).args(&args[1..]).exec();
+                    return Err(anyhow::anyhow!("exec failed: {}", err));
+                }
+
+                #[cfg(not(unix))]
+                {
+                    let _ = std::process::Command::new(&exe).args(&args[1..]).spawn();
+                    std::process::exit(0);
+                }
             }
         }
     }
