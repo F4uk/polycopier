@@ -178,12 +178,24 @@ async fn main() -> anyhow::Result<()> {
     match ui::start_tui(state.clone(), config.clone(), log_buffer.clone()).await? {
         ui::TuiExit::Quit => {}
         ui::TuiExit::Settings => {
-            // Re-run the wizard; the new .env is written by load_or_prompt.
-            // Then restart the process in-place so the new config is loaded.
-            drop(config::Config::load_or_prompt().await?);
+            // Settings were already saved to .env inside the TUI before this
+            // exit was triggered. Replace this process with a fresh instance
+            // so it starts cleanly with the new config.
             let exe = std::env::current_exe()?;
             let args: Vec<String> = std::env::args().collect();
-            let _ = std::process::Command::new(&exe).args(&args[1..]).status();
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(&exe).args(&args[1..]).exec(); // never returns on success
+                return Err(anyhow::anyhow!("exec failed: {}", err));
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new(&exe).args(&args[1..]).spawn();
+                std::process::exit(0);
+            }
         }
     }
 
