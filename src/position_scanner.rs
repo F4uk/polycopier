@@ -39,15 +39,22 @@ pub fn classify_position(
     max_copy_loss_pct: Decimal,
     max_copy_gain_pct: Decimal,
 ) -> ScanStatus {
-    // Reject resolved markets (redeemable=true), markets past their end date,
-    // AND same-day expiries (end_date == today).
+    // Reject resolved markets (redeemable=true) and markets whose end date has
+    // strictly passed (end_date < today).
     //
-    // Same-day markets are 5-min / 15-min binary prediction markets. Their CLOB
-    // order window closes minutes before settlement, so a catch-up GTC entry will
-    // almost always arrive after the window closes and get a 400 from the CLOB.
-    // Filtering them here prevents noisy 400 errors and wasted order attempts.
+    // We intentionally use < today, NOT <= today.
+    //
+    // Same-day markets (end_date == today) are still open and accepting orders.
+    // A 5-min BTC market resolving at 9:05am is still valid to enter at 9:01am.
+    // A daily "BTC above $80k on April 1" market is valid at 6am even if endDate=today.
+    //
+    // The authoritative "market is over" signal is redeemable=true, which Polymarket
+    // sets once settlement is confirmed on-chain. We rely on that, not the date.
+    //
+    // end_date < today is only a backstop for the edge case where redeemable hasn't
+    // been flipped yet for a market that resolved yesterday or earlier.
     let today = chrono::Utc::now().date_naive();
-    if redeemable || end_date.is_some_and(|d| d <= today) {
+    if redeemable || end_date.is_some_and(|d| d < today) {
         return ScanStatus::SkippedExpired;
     }
     if our_tokens.contains(token_id) {

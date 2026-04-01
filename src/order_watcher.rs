@@ -93,10 +93,12 @@ async fn run_once(
                     let pnl = p.percent_pnl;
                     let today = chrono::Utc::now().date_naive();
                     let redeemable = p.redeemable;
-                    // Gap 9: use <= today to match scanner's same-day expiry filter.
-                    // Previously < today caused same-day markets to stay in the watcher
-                    // 24h longer than needed.
-                    let expired = p.end_date.is_some_and(|d| d <= today);
+                    // Use < today (strictly past), NOT <= today.
+                    // A same-day market with redeemable=false is still open and our
+                    // GTC order should stay active until Polymarket flips redeemable=true.
+                    // Cancelling mid-day just because end_date=today would close valid
+                    // orders on 5-min or daily markets that haven't resolved yet.
+                    let expired = p.end_date.is_some_and(|d| d < today);
 
                     let entry = target_states.entry(tid).or_insert(TargetState {
                         pnl: Decimal::MIN,
