@@ -4,6 +4,7 @@ use crate::state::BotState;
 use crate::strategy::compute_order_usd;
 use alloy::primitives::Address;
 use anyhow::Result;
+use chrono::NaiveDate;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::data::Client as DataClient;
 use rust_decimal::Decimal;
@@ -28,12 +29,20 @@ pub fn classify_position(
     token_id: &str,
     cur_price: Decimal,
     percent_pnl: Decimal,
+    redeemable: bool,
+    end_date: Option<NaiveDate>,
     our_tokens: &HashSet<String>,
     already_queued: &HashSet<String>,
     min_price: Decimal,
     max_price: Decimal,
     max_copy_loss_pct: Decimal,
+    max_copy_gain_pct: Decimal,
 ) -> ScanStatus {
+    // Reject resolved markets (redeemable=true) or markets past their end date.
+    let today = chrono::Utc::now().date_naive();
+    if redeemable || end_date.is_some_and(|d| d < today) {
+        return ScanStatus::SkippedExpired;
+    }
     if our_tokens.contains(token_id) {
         ScanStatus::SkippedOwned
     } else if already_queued.contains(token_id) {
@@ -42,6 +51,8 @@ pub fn classify_position(
         ScanStatus::SkippedPrice
     } else if percent_pnl < -max_copy_loss_pct {
         ScanStatus::SkippedLoss
+    } else if percent_pnl > max_copy_gain_pct {
+        ScanStatus::SkippedGain
     } else {
         ScanStatus::Monitoring
     }
@@ -204,11 +215,14 @@ async fn scan_positions(
                 &token_id,
                 pos.cur_price,
                 pos.percent_pnl,
+                pos.redeemable,
+                pos.end_date,
                 &our_token_ids,
                 already_queued,
                 min_price,
                 max_price,
                 config.max_copy_loss_pct,
+                config.max_copy_gain_pct,
             );
 
             debug!(
@@ -219,22 +233,18 @@ async fn scan_positions(
                 pos.percent_pnl * Decimal::from(100)
             );
 
-            if status == ScanStatus::Monitoring && pos.cur_price > Decimal::ZERO {
-                // target_notional = what the target originally paid for this position
-                let target_notional = pos.avg_price * pos.size;
-                // NOTE: target_portfolio_usd will be computed after all positions are collected
-                // and read back from state on the next cycle for TargetPct. Here we use a
-                // placeholder; the per-position sizing below uses the freshly-computed total.
-                let budget_usd = Decimal::ZERO; // will be overwritten after full collection
-                let _ = budget_usd; // suppress warning; sizing done below using target_notional
-                let _ = target_notional; // stored in event below
+            if status == ScanStatus::Monitoring && pos.avg_price > Decimal::ZERO {
                 let short_id = &token_id[..token_id.len().min(8)];
                 let event = TradeEvent {
                     transaction_hash: format!("scan_{}", short_id),
                     maker_address: wallet_str.to_string(),
                     taker_address: wallet_str.to_string(),
                     token_id: token_id.clone(),
-                    price: pos.cur_price,
+                    // Use avg_price (what the target paid) not cur_price.
+                    // Strategy engine applies slippage on top: limit = avg_price × (1 + slippage).
+                    // If market is above avg_price  → GTC order waits for price to return.
+                    // If market is at/below avg_price → fills immediately at market (≤ limit).
+                    price: pos.avg_price,
                     // Store full target size -- strategy engine will apply budget cap via compute_order_usd
                     size: pos.size,
                     side: TradeSide::BUY,
