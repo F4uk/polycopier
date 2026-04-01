@@ -220,6 +220,22 @@ async fn scan_positions(
     let min_price = config.min_entry_price;
     let max_price = config.max_entry_price;
 
+    // Gap D fix: sync already_queued with the live pending_order_tokens set.
+    // The order watcher calls `guard.pending_order_tokens.remove(tid)` when it
+    // cancels a GTC order. Without this sync, the scanner would permanently treat
+    // those tokens as "already queued" until the bot restarts.
+    //
+    // We drop any token from already_queued that is no longer in pending_order_tokens
+    // AND is no longer held outright in our positions. This allows the scanner to
+    // re-enter a position after a GTC cancellation (e.g., target recovered from
+    // drawdown) while keeping the "skip positions we already hold" invariant.
+    {
+        let guard = state.read().await;
+        already_queued.retain(|tid| {
+            guard.pending_order_tokens.contains(tid) || guard.positions.contains_key(tid)
+        });
+    }
+
     // Brief read lock to snapshot our current holdings
     let (our_token_ids, current_balance) = {
         let guard = state.read().await;

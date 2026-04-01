@@ -79,7 +79,9 @@ async fn main() -> anyhow::Result<()> {
     // ── Boot sequence ─────────────────────────────────────────────────────────
     let config = config::Config::load_or_prompt().await?;
     let state = Arc::new(RwLock::new(state::BotState::new()));
-    let risk_engine = risk::RiskEngine::new(config.clone());
+    // Wrap RiskEngine in Arc<Mutex<>> so both strategy engine and order watcher
+    // can reference it — order watcher calls record_loss() on loss-triggered cancels.
+    let risk_engine = Arc::new(Mutex::new(risk::RiskEngine::new(config.clone())));
 
     let (poly_submitter, balance_fetcher, clob) = clients::build_order_submitter(&config).await?;
 
@@ -95,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     strategy::start_strategy_engine(
         event_rx,
         state.clone(),
-        risk_engine,
+        risk::RiskEngine::new(config.clone()),
         poly_submitter,
         config.clone(),
         copy_ledger.clone(),
@@ -154,7 +156,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Order watcher (cancel stale GTC orders every 10 s)
-    order_watcher::start_order_watcher(config.clone(), clob, state.clone());
+    // Gap C + Gap E: now receives risk_engine Arc to call record_loss() on loss-triggered
+    // cancellations, and uses exponential backoff on CLOB errors.
+    order_watcher::start_order_watcher(config.clone(), clob, state.clone(), risk_engine);
 
     // ── Main thread: TUI or headless wait ─────────────────────────────────────
     if headless {
