@@ -20,6 +20,9 @@ pub struct Config {
     pub max_delay_seconds: i64,
     /// Skip copying a position if the target is already this % underwater (e.g. 0.40 = 40% down)
     pub max_copy_loss_pct: Decimal,
+    /// Skip copying a position if the target is already this % in profit (e.g. 0.05 = 5% up).
+    /// Prevents chasing positions that have already moved -- slippage would erase any edge.
+    pub max_copy_gain_pct: Decimal,
     /// Minimum token price for catch-up entries (default 0.02 -- filters near-zero dust)
     pub min_entry_price: Decimal,
     /// Maximum token price for catch-up entries (default 0.999 -- allows near-certainty positions)
@@ -143,6 +146,9 @@ impl Config {
             }
         };
 
+        let max_copy_gain_str =
+            env::var("MAX_COPY_GAIN_PCT").unwrap_or_else(|_| "0.05".to_string());
+
         // Price range and proportional sizing -- read from env, no prompt (advanced settings)
         let min_entry_price_str =
             env::var("MIN_ENTRY_PRICE").unwrap_or_else(|_| "0.02".to_string());
@@ -220,6 +226,7 @@ impl Config {
             writeln!(file, "MAX_TRADE_SIZE_USD=\"{}\"", max_trade_size_str)?;
             writeln!(file, "MAX_DELAY_SECONDS=\"{}\"", max_delay_str)?;
             writeln!(file, "MAX_COPY_LOSS_PCT=\"{}\"", max_copy_loss_str)?;
+            writeln!(file, "MAX_COPY_GAIN_PCT=\"{}\"", max_copy_gain_str)?;
             writeln!(file, "MIN_ENTRY_PRICE=\"{}\"", min_entry_price_str)?;
             writeln!(file, "MAX_ENTRY_PRICE=\"{}\"", max_entry_price_str)?;
             writeln!(file, "SIZING_MODE=\"{}\"", sizing_mode_str)?;
@@ -248,6 +255,10 @@ impl Config {
             .parse::<Decimal>()
             .unwrap_or_else(|_| Decimal::from_str("0.20").unwrap());
 
+        let max_copy_gain_pct = max_copy_gain_str
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::from_str("0.05").unwrap());
+
         let min_entry_price = min_entry_price_str
             .parse::<Decimal>()
             .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap());
@@ -272,6 +283,7 @@ impl Config {
             max_trade_size_usd,
             max_delay_seconds,
             max_copy_loss_pct,
+            max_copy_gain_pct,
             min_entry_price,
             max_entry_price,
             sizing_mode,
@@ -363,6 +375,19 @@ impl Config {
             .prompt()
             .unwrap_or_else(|_| cur("MAX_COPY_LOSS_PCT"));
 
+        let max_copy_gain_str =
+            Text::new("Max target gain before skipping catch-up (e.g. 0.05 = 5%):")
+                .with_default(&{
+                    let v = cur("MAX_COPY_GAIN_PCT");
+                    if v.is_empty() {
+                        "0.05".into()
+                    } else {
+                        v
+                    }
+                })
+                .prompt()
+                .unwrap_or_else(|_| cur("MAX_COPY_GAIN_PCT"));
+
         let min_entry_price_str = Text::new("Min entry price for catch-up trades (e.g. 0.02):")
             .with_default(&{
                 let v = cur("MIN_ENTRY_PRICE");
@@ -442,6 +467,7 @@ impl Config {
         writeln!(file, "MAX_TRADE_SIZE_USD=\"{}\"", max_trade_size_str)?;
         writeln!(file, "MAX_DELAY_SECONDS=\"{}\"", max_delay_str)?;
         writeln!(file, "MAX_COPY_LOSS_PCT=\"{}\"", max_copy_loss_str)?;
+        writeln!(file, "MAX_COPY_GAIN_PCT=\"{}\"", max_copy_gain_str)?;
         writeln!(file, "MIN_ENTRY_PRICE=\"{}\"", min_entry_price_str)?;
         writeln!(file, "MAX_ENTRY_PRICE=\"{}\"", max_entry_price_str)?;
         writeln!(file, "SIZING_MODE=\"{}\"", sizing_mode_str)?;
@@ -469,6 +495,10 @@ impl Config {
             .parse::<Decimal>()
             .unwrap_or_else(|_| Decimal::from_str("0.20").unwrap());
 
+        let max_copy_gain_pct = max_copy_gain_str
+            .parse::<Decimal>()
+            .unwrap_or_else(|_| Decimal::from_str("0.05").unwrap());
+
         let min_entry_price = min_entry_price_str
             .parse::<Decimal>()
             .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap());
@@ -495,6 +525,7 @@ impl Config {
             max_trade_size_usd,
             max_delay_seconds,
             max_copy_loss_pct,
+            max_copy_gain_pct,
             min_entry_price,
             max_entry_price,
             sizing_mode,

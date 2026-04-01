@@ -61,7 +61,9 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
 
 - **Adaptive open-position scanner** - catches positions the target opened before the bot
   started. Scan interval scales from 10s (target position still at entry price) to 60s
-  (price has moved significantly or no enterable positions exist).
+  (price has moved significantly or no enterable positions exist). Catch-up orders are priced
+  at the **target's average entry price** (not the current market price), so you pay what
+  the target paid — not whatever the market is at when the scanner fires.
 
 - **Intent classification** - every incoming BUY and SELL is checked against the target's
   last-known positions to determine true intent (fresh entry, adding to long, closing long,
@@ -89,15 +91,27 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
 
   All modes enforce a $5.00 CLOB minimum and `MAX_TRADE_SIZE_USD` ceiling.
 
-- **Risk engine** - per-trade minimum notional ($5.00 CLOB floor), per-trade size cap (`MAX_TRADE_SIZE_USD`), and
-  per-position drawdown filter (`MAX_COPY_LOSS_PCT`).
+- **Risk engine** - per-trade minimum notional ($5.00 CLOB floor), per-trade size cap (`MAX_TRADE_SIZE_USD`), and three scanner guards:
+  - `MAX_COPY_LOSS_PCT` — skip catch-up entries where the target is already too far underwater (position is declining; don't follow a loser even at a cheaper price)
+  - `MAX_COPY_GAIN_PCT` — skip catch-up entries where the target is already too far in profit (price has moved away from their entry; chasing adds slippage with no edge)
+  - **Expiry guard** — skip any position on a market with `redeemable=true` (already resolved) or whose `endDate` is in the past
 
 - **Terminal UI** - six-panel ratatui interface:
   - Account dashboard (balance, PnL, **API-sourced Copied counter**)
   - Live copy feed (pass/fail, skip reason per event)
   - **Copied & Open positions table** (only positions confirmed open in both our wallet
     and a target wallet; shows SOURCE WALLET, entry quality, OUR_PNL%)
-  - Opportunity scanner table (color-coded by status, live refresh timing)
+  - Opportunity scanner table (color-coded by status, live refresh timing):
+
+    | Status | Meaning |
+    |---|---|
+    | `[W] WATCH` | Valid candidate — will be entered next cycle |
+    | `[Q] QUEUED` | Order already submitted this session |
+    | `[H] HELD` | We already own this token |
+    | `[X] LOSS` | Target too far underwater (`MAX_COPY_LOSS_PCT`) |
+    | `[^] GAIN` | Target already too far in profit (`MAX_COPY_GAIN_PCT`) |
+    | `[-] RANGE` | Current price outside `MIN/MAX_ENTRY_PRICE` |
+    | `[E] EXPRD` | Market resolved or past end date — never entered |
   - **Settings panel** (live config summary, `[s]` to open wizard)
   - **System Logs panel** (WARN+ captured in-memory, never corrupts the TUI)
 
@@ -183,12 +197,13 @@ cargo run --release
 | `TARGET_WALLETS` | Yes | - | Comma-separated list of target proxy wallet addresses to copy |
 | `SIZING_MODE` | No | `self_pct` | Sizing strategy: `self_pct`, `target_usd`, or `fixed` |
 | `COPY_SIZE_PCT` | No | `0.15` | Fraction of our balance per trade when `SIZING_MODE=self_pct` (e.g. `0.15` = 15%) |
-| `MAX_SLIPPAGE_PCT` | No | `0.02` | Maximum allowed price deviation from the copied trade (2% = `0.02`) |
+| `MAX_SLIPPAGE_PCT` | No | `0.02` | Slippage buffer added to the target's avg entry price for limit orders (2% = `0.02`) |
 | `MAX_TRADE_SIZE_USD` | No | `10.00` | Maximum USDC to spend per copied trade |
 | `MAX_DELAY_SECONDS` | No | `10` | Discard live trade events (listener) older than this many seconds |
-| `MAX_COPY_LOSS_PCT` | No | `0.40` | Skip catch-up entries where the target is already this far underwater (40% = `0.40`) |
-| `MIN_ENTRY_PRICE` | No | `0.02` | Minimum token price accepted for catch-up entries (filters near-zero dust) |
-| `MAX_ENTRY_PRICE` | No | `0.998` | Maximum token price accepted for catch-up entries. Raise above `0.95` when copying targets who trade high-confidence NO positions (e.g. `0.998`) |
+| `MAX_COPY_LOSS_PCT` | No | `0.20` | Skip catch-up entries where target is already this far in the red — risk filter, not price filter (20% = `0.20`) |
+| `MAX_COPY_GAIN_PCT` | No | `0.05` | Skip catch-up entries where target is already this far in profit — prevents chasing moved positions (5% = `0.05`) |
+| `MIN_ENTRY_PRICE` | No | `0.02` | Minimum current token price for catch-up entries (filters near-zero dust) |
+| `MAX_ENTRY_PRICE` | No | `0.999` | Maximum current token price for catch-up entries. Raise above `0.95` when copying targets who trade high-confidence NO positions |
 
 ### Wallet Type
 
@@ -217,7 +232,7 @@ On first run with an empty or placeholder `.env`, the setup wizard prompts for:
 3. Target wallet addresses
 4. Sizing mode (menu: `self_pct` / `target_usd` / `fixed`)
 5. `COPY_SIZE_PCT` only if `self_pct` was chosen (default 15%)
-6. Slippage, trade size, delay, and loss-threshold limits
+6. Slippage, trade size, delay, loss threshold, and gain threshold limits
 
 All values are saved to `.env` and reused on subsequent runs.
 Press **`[s]`** inside the TUI at any time to re-run the wizard and update settings.

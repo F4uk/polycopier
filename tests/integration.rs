@@ -28,6 +28,7 @@ fn test_config() -> polycopier::config::Config {
         max_trade_size_usd: dec!(10.00),
         max_delay_seconds: 2,
         max_copy_loss_pct: dec!(0.40),
+        max_copy_gain_pct: dec!(0.05),
         min_entry_price: dec!(0.02),
         max_entry_price: dec!(0.999),
         sizing_mode: SizingMode::Fixed,
@@ -516,6 +517,7 @@ mod scanner_tests {
     const MIN: &str = "0.02";
     const MAX: &str = "0.95";
     const LOSS: &str = "0.40";
+    const GAIN: &str = "0.05";
 
     fn min() -> Decimal {
         MIN.parse().unwrap()
@@ -526,6 +528,9 @@ mod scanner_tests {
     fn loss() -> Decimal {
         LOSS.parse().unwrap()
     }
+    fn gain() -> Decimal {
+        GAIN.parse().unwrap()
+    }
 
     fn classify(
         token: &str,
@@ -534,7 +539,20 @@ mod scanner_tests {
         owned: &HashSet<String>,
         queued: &HashSet<String>,
     ) -> ScanStatus {
-        classify_position(token, price, pnl, owned, queued, min(), max(), loss())
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).date_naive();
+        classify_position(
+            token,
+            price,
+            pnl,
+            false,
+            Some(tomorrow),
+            owned,
+            queued,
+            min(),
+            max(),
+            loss(),
+            gain(),
+        )
     }
 
     #[test]
@@ -661,26 +679,110 @@ mod scanner_tests {
     }
 
     #[test]
-    fn positive_pnl_is_monitoring() {
+    fn positive_pnl_below_gain_threshold_is_monitoring() {
+        // +3% < 5% threshold -> Monitoring (already covered by positive_pnl_below_threshold above,
+        // but kept as a direct replacement for the old positive_pnl_is_monitoring test)
         assert_eq!(
-            classify("t1", dec!(0.60), dec!(0.15), &empty_set(), &empty_set()),
+            classify("t1", dec!(0.60), dec!(0.03), &empty_set(), &empty_set()),
             ScanStatus::Monitoring
         );
     }
 
     #[test]
+    fn positive_pnl_above_gain_threshold_is_skipped() {
+        // +15% >> 5% threshold -> SkippedGain (old test used 0.15 and expected Monitoring -- now it's caught)
+        assert_eq!(
+            classify("t1", dec!(0.60), dec!(0.15), &empty_set(), &empty_set()),
+            ScanStatus::SkippedGain
+        );
+    }
+
+    #[test]
     fn zero_loss_threshold_rejects_any_negative_pnl() {
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).date_naive();
         let status = classify_position(
             "t1",
             dec!(0.50),
             dec!(-0.01),
+            false,
+            Some(tomorrow),
             &empty_set(),
             &empty_set(),
             min(),
             max(),
             dec!(0),
+            gain(),
         );
         assert_eq!(status, ScanStatus::SkippedLoss);
+    }
+
+    #[test]
+    fn already_up_past_gain_threshold_is_skipped_gain() {
+        // pnl = +6% > GAIN threshold of 5% -> SkippedGain
+        assert_eq!(
+            classify("t1", dec!(0.56), dec!(0.06), &empty_set(), &empty_set()),
+            ScanStatus::SkippedGain
+        );
+    }
+
+    #[test]
+    fn exactly_at_gain_threshold_is_not_skipped() {
+        // pnl = +5% == threshold -> should still be Monitoring (strict >)
+        assert_eq!(
+            classify("t1", dec!(0.55), dec!(0.05), &empty_set(), &empty_set()),
+            ScanStatus::Monitoring
+        );
+    }
+
+    #[test]
+    fn positive_pnl_below_threshold_is_monitoring() {
+        // +3% < 5% threshold -> Monitoring
+        assert_eq!(
+            classify("t1", dec!(0.53), dec!(0.03), &empty_set(), &empty_set()),
+            ScanStatus::Monitoring
+        );
+    }
+
+    #[test]
+    fn redeemable_position_is_skipped_expired() {
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).date_naive();
+        assert_eq!(
+            classify_position(
+                "t1",
+                dec!(0.50),
+                dec!(0.0),
+                true,
+                Some(tomorrow),
+                &empty_set(),
+                &empty_set(),
+                min(),
+                max(),
+                loss(),
+                gain(),
+            ),
+            ScanStatus::SkippedExpired
+        );
+    }
+
+    #[test]
+    fn past_end_date_is_skipped_expired() {
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+        assert_eq!(
+            classify_position(
+                "t1",
+                dec!(0.50),
+                dec!(0.0),
+                false,
+                Some(yesterday),
+                &empty_set(),
+                &empty_set(),
+                min(),
+                max(),
+                loss(),
+                gain(),
+            ),
+            ScanStatus::SkippedExpired
+        );
     }
 
     #[test]
@@ -693,6 +795,102 @@ mod scanner_tests {
         assert_eq!(
             classify("owned_token", dec!(0.50), dec!(-0.10), &owned, &empty_set()),
             ScanStatus::SkippedOwned
+        );
+    }
+}
+
+// -- Scanner avg_price entry logic ---------------------------------------------
+//
+// The position scanner creates TradeEvents with price = avg_price (what the
+// target paid) instead of cur_price (current market). The strategy engine then
+// applies slippage: limit = avg_price * (1 + MAX_SLIPPAGE_PCT).
+//
+// This ensures we try to pay what the target paid rather than chasing
+// a price that may have already moved significantly.
+
+mod scanner_avg_price_tests {
+    use super::*;
+
+    // Simulates: target bought at 89¢, market now at 94¢ (target up 5.6%).
+    // With MAX_COPY_GAIN_PCT=0.05 this is right at the boundary but let's
+    // test the price mechanics with a position that passes the gain filter (+4%).
+    #[test]
+    fn limit_is_based_on_avg_price_not_cur_price() {
+        let avg_price = dec!(0.89);
+        let cur_price = dec!(0.927); // +4.2% -- within 5% gain threshold
+
+        let limit_from_avg = calculate_limit_price(avg_price, TradeSide::BUY, dec!(0.02));
+        let limit_from_cur = calculate_limit_price(cur_price, TradeSide::BUY, dec!(0.02));
+
+        // Limit based on avg_price is strictly lower than cur_price-based limit
+        assert!(
+            limit_from_avg < limit_from_cur,
+            "avg-based limit {limit_from_avg} should be below cur-based limit {limit_from_cur}"
+        );
+
+        // Limit should be avg_price * 1.02 = 0.89 * 1.02 = 0.9078 -> rounds to 0.91
+        assert_eq!(limit_from_avg, dec!(0.91));
+    }
+
+    // When target is DOWN from their entry (cur_price < avg_price):
+    // limit = avg_price * (1+slippage) > cur_price
+    // -> on the CLOB this fills immediately at cur_price (cheaper!)
+    #[test]
+    fn target_underwater_limit_above_market_fills_at_discount() {
+        let avg_price = dec!(0.89);
+        let cur_price = dec!(0.80); // target is down 10%
+
+        let limit = calculate_limit_price(avg_price, TradeSide::BUY, dec!(0.02));
+
+        // Limit = 0.89 * 1.02 = 0.9078 -> 0.91
+        assert_eq!(limit, dec!(0.91));
+
+        // The limit (0.91) is > cur_price (0.80), so the CLOB fills at 0.80
+        // (the current ask), which is better than the target's avg of 0.89
+        assert!(
+            limit > cur_price,
+            "limit {limit} should be above cur_price {cur_price} -- order fills at cur_price"
+        );
+    }
+
+    // When target entry price was very high (e.g. 98¢), limit is capped at 0.99
+    #[test]
+    fn high_avg_price_limit_capped_at_099() {
+        let avg_price = dec!(0.98);
+        let limit = calculate_limit_price(avg_price, TradeSide::BUY, dec!(0.02));
+        // 0.98 * 1.02 = 0.9996 -> would round to 1.00, but is capped at 0.99
+        assert_eq!(limit, dec!(0.99));
+    }
+
+    // Worst-case premium over target's avg price
+    // = (1 + MAX_COPY_GAIN_PCT) * (1 + MAX_SLIPPAGE_PCT) - 1
+    // With GAIN=5% and SLIPPAGE=2%: 1.05 * 1.02 - 1 = 7.1%
+    // With GAIN=2% and SLIPPAGE=1%: 1.02 * 1.01 - 1 = 3.02%
+    #[test]
+    fn worst_case_premium_over_target_entry() {
+        let avg_price = dec!(0.50);
+        let max_copy_gain_pct = dec!(0.05);
+        let slippage = dec!(0.02);
+
+        // Maximum cur_price that still passes the gain filter
+        let max_allowed_cur = avg_price * (Decimal::ONE + max_copy_gain_pct);
+        // Limit order on top of avg_price
+        let our_limit = calculate_limit_price(avg_price, TradeSide::BUY, slippage);
+
+        let premium_over_avg = (our_limit / avg_price) - Decimal::ONE;
+
+        // Our limit is only slippage% above avg_price (not above cur_price)
+        assert_eq!(
+            premium_over_avg, slippage,
+            "our limit should be exactly slippage% above avg_price"
+        );
+
+        // And the worst-case we'd ever pay vs target's entry is just the slippage,
+        // since we price off avg_price not cur_price.
+        // (cur_price up to avg*(1+gain) is just for the WATCH filter, not the order price)
+        assert!(
+            our_limit < max_allowed_cur,
+            "our limit {our_limit} should still be under max allowed cur {max_allowed_cur}"
         );
     }
 }

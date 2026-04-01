@@ -79,11 +79,13 @@ pub struct OrderRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanStatus {
-    Monitoring,   // Valid entry candidate
-    Entered,      // Order queued this session
-    SkippedOwned, // We already hold this token
-    SkippedLoss,  // Too far underwater
-    SkippedPrice, // Price out of valid range
+    Monitoring,     // Valid entry candidate
+    Entered,        // Order queued this session
+    SkippedOwned,   // We already hold this token
+    SkippedLoss,    // Too far underwater
+    SkippedGain,    // Target already too far in profit -- chasing is pointless
+    SkippedPrice,   // Price out of valid range
+    SkippedExpired, // Market resolved or past end date
 }
 
 impl ScanStatus {
@@ -93,7 +95,9 @@ impl ScanStatus {
             Self::Entered => "[Q] QUEUED",
             Self::SkippedOwned => "[H] HELD",
             Self::SkippedLoss => "[X] LOSS",
+            Self::SkippedGain => "[^] GAIN",
             Self::SkippedPrice => "[-] RANGE",
+            Self::SkippedExpired => "[E] EXPRD",
         }
     }
     pub fn color(&self) -> Color {
@@ -102,7 +106,9 @@ impl ScanStatus {
             Self::Entered => Color::Cyan,
             Self::SkippedOwned => Color::Magenta,
             Self::SkippedLoss => Color::Red,
+            Self::SkippedGain => Color::Yellow,
             Self::SkippedPrice => Color::DarkGray,
+            Self::SkippedExpired => Color::DarkGray,
         }
     }
     pub fn sort_key(&self) -> u8 {
@@ -111,7 +117,9 @@ impl ScanStatus {
             Self::Entered => 1,
             Self::SkippedOwned => 2,
             Self::SkippedLoss => 3,
-            Self::SkippedPrice => 4,
+            Self::SkippedGain => 4,
+            Self::SkippedPrice => 5,
+            Self::SkippedExpired => 6,
         }
     }
 }

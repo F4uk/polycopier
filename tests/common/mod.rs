@@ -24,6 +24,7 @@ pub fn test_config() -> Config {
         max_trade_size_usd: dec!(10.00),
         max_delay_seconds: 2,
         max_copy_loss_pct: dec!(0.40),
+        max_copy_gain_pct: dec!(0.05),
         min_entry_price: dec!(0.02),
         max_entry_price: dec!(0.999),
         sizing_mode: SizingMode::Fixed,
