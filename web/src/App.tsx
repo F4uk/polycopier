@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import SettingsManager from './SettingsManager';
 import SetupWizard from './SetupWizard';
+import AiPanel from './AiPanel';
 
 function App() {
   const [state, setState] = useState<any>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'settings' | 'ai'>('dashboard');
   const [setupRequired, setSetupRequired] = useState(false);
 
   useEffect(() => {
@@ -100,6 +101,7 @@ function App() {
           </div>
           <div className="nav-tabs">
             <button className={`nav-tab ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>Dashboard</button>
+            <button className={`nav-tab ${activeTab === 'ai' ? 'active' : ''}`} onClick={() => setActiveTab('ai')}>AI Stats</button>
             <button className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>Settings & Env</button>
           </div>
         </div>
@@ -130,7 +132,18 @@ function App() {
         </div>
       </header>
 
-      {activeTab === 'dashboard' ? (
+      {activeTab === 'ai' ? (
+        <AiPanel
+          walletStats={state.wallet_stats || {}}
+          mutedMarkets={state.muted_markets || []}
+          todayCopies={state.today_copies || 0}
+          todayWins={state.today_wins || 0}
+          todayLosses={state.today_losses || 0}
+          todayPnl={state.today_pnl || '0'}
+          isFrozen={state.is_frozen || false}
+          freezeUntilSecs={state.freeze_until_secs}
+        />
+      ) : activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           {/* Our Open Positions - FULL WIDTH */}
           <div className="glass-panel">
@@ -326,9 +339,9 @@ function App() {
           </div>
         </div>
       </div>
-      ) : (
+      ) : activeTab === 'settings' ? (
         <SettingsManager />
-      )}
+      ) : null}
     </div>
   );
 }

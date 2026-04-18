@@ -1,4 +1,5 @@
 pub mod api;
+pub mod api_control;
 pub mod backoff;
 pub mod clients;
 pub mod config;
@@ -10,11 +11,14 @@ pub mod models;
 pub mod order_watcher;
 pub mod position_scanner;
 pub mod risk;
+pub mod slippage_guard;
 pub mod state;
+pub mod stop_loss;
 pub mod strategy;
 pub mod ui;
 pub mod utils;
 pub mod wallet_sync;
+pub mod wash_trade_filter;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -212,6 +216,14 @@ async fn main() -> anyhow::Result<()> {
     // can reference it — order watcher calls record_loss() on loss-triggered cancels.
     let risk_engine = Arc::new(Mutex::new(risk::RiskEngine::new(config.clone())));
 
+    // Stop-loss / take-profit state — initialized from config before strategy engine starts.
+    let sl_state = Arc::new(Mutex::new(stop_loss::StopLossState::new(
+        config.stop_loss_enabled,
+        config.stop_loss_pct,
+        config.take_profit_pct,
+        config.stop_loss_check_interval_secs,
+    )));
+
     let (poly_submitter, balance_fetcher, clob) = if config.is_sim {
         clients::build_sim_order_submitter(&config).await?
     } else {
@@ -232,6 +244,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let copy_ledger = Arc::new(Mutex::new(copy_ledger::CopyLedger::load_from(ledger_path)));
 
+    // ── Wash-trade filter + shared submitter ──────────────────────────────────
+    // OrderSubmitter is already an Arc<Fn>; clone it so both the strategy engine
+    // and the API router share the same underlying submitter closure.
+    let submitter_for_api = Arc::clone(&poly_submitter);
+    let submitter_for_stop_loss = Arc::clone(&poly_submitter);
+
     strategy::start_strategy_engine(
         event_rx,
         state.clone(),
@@ -241,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         copy_ledger.clone(),
         strategy::make_live_holds_query(),
         strategy::make_live_end_date_query(),
+        sl_state.clone(),
     );
 
     // ── Background tasks ──────────────────────────────────────────────────────
@@ -307,7 +326,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Local Web API Server ──────────────────────────────────────────────────
-    let api_router = api::create_router(state.clone(), copy_ledger.clone());
+    // AI endpoints (/ai/close, /ai/freeze), AI stats (/api/ai/stats),
+    // and market mute (/api/ai/markets) all run on the same port 3000.
+    let api_router = api::create_router(state.clone(), copy_ledger.clone(), submitter_for_api);
+
+    // ── Stop-loss / take-profit monitor ──────────────────────────────────────
+    stop_loss::start_stop_loss_monitor(
+        state.clone(),
+        sl_state.clone(),
+        submitter_for_stop_loss,
+        config.clone(),
+    );
+
     if is_ui {
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind("127.0.0.1:3000").await {

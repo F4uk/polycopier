@@ -3,7 +3,9 @@ use crate::config::Config;
 use crate::copy_ledger::CopyLedger;
 use crate::models::{EvaluatedTrade, OrderRequest, SizingMode, TradeEvent, TradeSide};
 use crate::risk::RiskEngine;
+use crate::slippage_guard;
 use crate::state::BotState;
+use crate::wash_trade_filter;
 use alloy::primitives::Address;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::data::Client as DataClient;
@@ -344,6 +346,7 @@ pub fn start_strategy_engine(
     copy_ledger: Arc<Mutex<CopyLedger>>,
     holds_query: HoldsQuery,
     end_date_query: EndDateQuery,
+    sl_state: Arc<Mutex<crate::stop_loss::StopLossState>>,
 ) {
     tokio::spawn(async move {
         info!("Strategy Engine Started. Monitoring edge cases (debouncing, closures...)");
@@ -351,6 +354,8 @@ pub fn start_strategy_engine(
         let mut debounce = DebounceCache::new();
         let mut live_cache = LiveQueryCache::new();
         let mut end_date_cache = EndDateCache::new();
+        // Wash-trade filter: detects coordinated same-address / same-token patterns
+        let mut wash_filter = wash_trade_filter::WashTradeFilter::new();
         // Periodic cache maintenance counter
         let mut event_count: u32 = 0;
 
@@ -387,6 +392,30 @@ pub fn start_strategy_engine(
                 if let Err(reason) = risk_engine.check_trade(&event) {
                     eval.validated = false;
                     eval.reason = Some(reason);
+                }
+            }
+
+            // 4. Market mute check — skip if this market is muted
+            if eval.validated {
+                let is_muted = {
+                    let guard = state.read().await;
+                    guard.is_market_muted(&event.token_id)
+                };
+                if is_muted {
+                    eval.validated = false;
+                    eval.reason = Some("Market is muted".to_string());
+                }
+            }
+
+            // 5. AI freeze check — block BUY entries when frozen (from /ai/freeze)
+            if eval.validated && event.side == TradeSide::BUY {
+                let is_frozen = {
+                    let guard = state.read().await;
+                    guard.is_frozen()
+                };
+                if is_frozen {
+                    eval.validated = false;
+                    eval.reason = Some("Trading is frozen (AI freeze active)".to_string());
                 }
             }
 
@@ -620,6 +649,53 @@ pub fn start_strategy_engine(
                     }
                 } else {
                     // -- BUY: size according to active SizingMode, capped and $5 floored --
+
+                    // 6. Slippage guard: reject if spread > 2.5% or depth < $2000
+                    let guard_limit_price =
+                        slippage_guard::limit_price(event.price, TradeSide::BUY);
+                    if let Err(reason) =
+                        slippage_guard::check_spread(event.price, guard_limit_price)
+                    {
+                        warn!(
+                            "BUY skipped (slippage): {} for token {}",
+                            reason,
+                            &event.token_id[..event.token_id.len().min(12)]
+                        );
+                        eval.validated = false;
+                        eval.reason = Some(format!("Slippage guard: {}", reason));
+                    } else if let Err(reason) =
+                        slippage_guard::check_depth(&event.token_id, TradeSide::BUY)
+                    {
+                        warn!(
+                            "BUY skipped (depth): {} for token {}",
+                            reason,
+                            &event.token_id[..event.token_id.len().min(12)]
+                        );
+                        eval.validated = false;
+                        eval.reason = Some(format!("Depth guard: {}", reason));
+                    }
+
+                    // 7. Wash-trade filter: reject if same address ≥3 trades in 60s
+                    if eval.validated && wash_filter.is_wash_trade(&event.taker_address, &event) {
+                        warn!(
+                            "BUY skipped (wash): wash trade detected for address {} on token {}",
+                            &event.taker_address[..event.taker_address.len().min(10)],
+                            &event.token_id[..event.token_id.len().min(12)]
+                        );
+                        wash_filter.record(&event.taker_address, &event);
+                        eval.validated = false;
+                        eval.reason = Some("Wash trade detected".to_string());
+                    } else {
+                        wash_filter.record(&event.taker_address, &event);
+                    }
+
+                    if !eval.validated {
+                        // Push feed and skip sizing
+                        let mut g = state.write().await;
+                        g.push_evaluated_trade(eval.clone());
+                        continue;
+                    }
+
                     let current_balance = {
                         let guard = state.read().await;
                         guard.total_balance
@@ -738,6 +814,7 @@ pub fn start_strategy_engine(
                     };
 
                     let is_sim = config.is_sim;
+                    let sl_state_clone = sl_state.clone();
 
                     tokio::spawn(async move {
                         match submitter_clone(order).await {
@@ -759,6 +836,12 @@ pub fn start_strategy_engine(
                                         // price refresh corrects the full sum within 20s.
                                         let old_unrealized = (order_price - avg_entry) * order_size;
                                         guard.unrealized_pnl -= old_unrealized;
+                                        // Update AI wallet stats
+                                        if pnl >= Decimal::ZERO {
+                                            guard.record_win(&source_wallet_clone, pnl);
+                                        } else {
+                                            guard.record_loss(&source_wallet_clone, pnl);
+                                        }
                                     }
                                 } else {
                                     ledger.record_copy(
@@ -772,6 +855,11 @@ pub fn start_strategy_engine(
                                         &token_id_clone[..token_id_clone.len().min(12)],
                                         &source_wallet_clone[..source_wallet_clone.len().min(10)],
                                     );
+                                    // Track entry price for stop-loss / take-profit monitor
+                                    sl_state_clone
+                                        .lock()
+                                        .await
+                                        .record_entry(token_id_clone.clone(), order_price);
                                 }
 
                                 if is_sim {

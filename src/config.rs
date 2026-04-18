@@ -43,6 +43,7 @@ pub struct BotConfig {
     pub scanner: ScannerConfig,
     pub risk: RiskConfig,
     pub ledger: LedgerConfig,
+    pub stop_loss: StopLossConfig,
 }
 
 /// Copy-trade target wallets — public on-chain addresses, safe in config.toml.
@@ -104,6 +105,19 @@ pub struct LedgerConfig {
     pub retention_days: u32,
 }
 
+/// Local stop-loss / take-profit monitoring config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopLossConfig {
+    /// Enable local stop-loss / take-profit monitoring.
+    pub enabled: bool,
+    /// Exit when price drops this % below entry (e.g. 0.15 = 15%).
+    pub stop_loss_pct: Decimal,
+    /// Exit when price rises this % above entry (e.g. 0.30 = 30%).
+    pub take_profit_pct: Decimal,
+    /// How often (seconds) to check price levels. Default 60.
+    pub check_interval_secs: u64,
+}
+
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +146,12 @@ impl Default for BotConfig {
                 loss_cooldown_secs: 300,
             },
             ledger: LedgerConfig { retention_days: 90 },
+            stop_loss: StopLossConfig {
+                enabled: true,
+                stop_loss_pct: Decimal::from_str("0.15").unwrap(),
+                take_profit_pct: Decimal::from_str("0.30").unwrap(),
+                check_interval_secs: 60,
+            },
         }
     }
 }
@@ -171,6 +191,11 @@ pub struct Config {
     pub max_daily_volume_usd: Decimal,
     pub max_consecutive_losses: u32,
     pub loss_cooldown_secs: u64,
+    // Stop-loss / take-profit tunables
+    pub stop_loss_enabled: bool,
+    pub stop_loss_pct: Decimal,
+    pub take_profit_pct: Decimal,
+    pub stop_loss_check_interval_secs: u64,
     pub is_sim: bool,
     pub sim_balance: Option<rust_decimal::Decimal>,
 }
@@ -275,6 +300,16 @@ loss_cooldown_secs = {cooldown}
 [ledger]
 # Days to keep closed ledger entries before pruning on startup. 0 = never prune.
 retention_days = {retention}
+
+[stop_loss]
+# Enable local stop-loss / take-profit monitoring
+enabled = {sl_enabled}
+# Stop-loss: exit when price drops this % below entry (0.15 = 15%)
+stop_loss_pct = {sl_pct}
+# Take-profit: exit when price rises this % above entry (0.30 = 30%)
+take_profit_pct = {tp_pct}
+# How often (seconds) to check price levels
+check_interval_secs = {sl_interval}
 "#,
         wallets = wallets_toml,
         slippage = cfg.execution.max_slippage_pct,
@@ -299,6 +334,10 @@ retention_days = {retention}
         consec_loss = cfg.risk.max_consecutive_losses,
         cooldown = cfg.risk.loss_cooldown_secs,
         retention = cfg.ledger.retention_days,
+        sl_enabled = cfg.stop_loss.enabled,
+        sl_pct = cfg.stop_loss.stop_loss_pct,
+        tp_pct = cfg.stop_loss.take_profit_pct,
+        sl_interval = cfg.stop_loss.check_interval_secs,
     );
     fs::write(CONFIG_TOML_PATH, content)?;
     Ok(())
@@ -418,6 +457,15 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
         },
         ledger: LedgerConfig {
             retention_days: u32v("LEDGER_RETENTION_DAYS", defaults.ledger.retention_days),
+        },
+        stop_loss: StopLossConfig {
+            enabled: true,
+            stop_loss_pct: dec("STOP_LOSS_PCT", defaults.stop_loss.stop_loss_pct),
+            take_profit_pct: dec("TAKE_PROFIT_PCT", defaults.stop_loss.take_profit_pct),
+            check_interval_secs: u64v(
+                "STOP_LOSS_CHECK_INTERVAL_SECS",
+                defaults.stop_loss.check_interval_secs,
+            ),
         },
     }
 }
@@ -631,6 +679,10 @@ impl Config {
             max_daily_volume_usd: cfg.risk.max_daily_volume_usd,
             max_consecutive_losses: cfg.risk.max_consecutive_losses,
             loss_cooldown_secs: cfg.risk.loss_cooldown_secs,
+            stop_loss_enabled: cfg.stop_loss.enabled,
+            stop_loss_pct: cfg.stop_loss.stop_loss_pct,
+            take_profit_pct: cfg.stop_loss.take_profit_pct,
+            stop_loss_check_interval_secs: cfg.stop_loss.check_interval_secs,
             is_sim: false, // Injected dynamically in Config::load_or_prompt wrapper
             sim_balance: None,
         }
