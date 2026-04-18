@@ -1,0 +1,33 @@
+# Build output
+/target
+
+# Environment files — never commit secrets
+.env
+.env.local
+.env.production
+
+# Per-environment tunable config — auto-generated from config.example.toml on first run
+# Commit config.example.toml instead; each environment manages its own config.toml
+config.toml
+
+# Runtime logs and data
+*.log
+bot.log
+
+# Persistent runtime state — auto-created on first trade, never commit
+copy_ledger.json
+sim_copy_ledger.json
+*.json.tmp
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Rust
+Cargo.lock
+.agents/
+
+src/bin/order_test.rs

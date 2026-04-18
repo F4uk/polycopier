@@ -1,0 +1,38 @@
+[package]
+name = "polycopier"
+version = "0.1.0"
+edition = "2021"
+default-run = "polycopier"
+description = "A high-performance, terminal-based copy trading bot for Polymarket prediction markets."
+license = "MIT"
+repository = "https://github.com/cbaezp/polycopier"
+readme = "README.md"
+keywords = ["polymarket", "trading", "bot", "prediction-markets", "copy-trading"]
+categories = ["command-line-utilities", "finance"]
+
+[dependencies]
+tokio         = { version = "1.37", features = ["full"] }
+serde         = { version = "1.0",  features = ["derive"] }
+serde_json    = "1.0"
+toml          = { version = "0.8", features = ["parse"] }
+reqwest       = { version = "0.12", features = ["json"] }
+ratatui       = "0.26"
+crossterm     = "0.27"
+dotenvy       = "0.15"
+tracing       = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust_decimal  = "1.35"
+anyhow        = "1.0"
+thiserror     = "1.0"
+chrono        = "0.4"
+alloy         = { version = "1.8.3", features = ["signers", "network"] }
+inquire       = "0.7"
+polymarket-client-sdk = { git = "https://github.com/Polymarket/rs-clob-client.git", features = ["ws", "gamma", "data", "clob"] }
+axum = "0.8.8"
+tower-http = { version = "0.6.8", features = ["cors", "fs"] }
+
+[dependencies.rust_decimal_macros]
+version = "1.35"
+
+[dev-dependencies]
+tokio = { version = "1.37", features = ["full", "test-util"] }

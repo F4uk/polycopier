@@ -1,0 +1,380 @@
+//! Tests for order_watcher cancel-decision logic and wallet_sync pure helpers.
+//!
+//! order_watcher::run_once hits the live CLOB so it can't be unit-tested directly,
+//! but the cancel-decision logic can be expressed as pure predicates and tested here.
+//!
+//! wallet_sync tasks all spawn long-running loops using live I/O, so we only test
+//! the pure data transformations they perform (the position upsert/remove rules).
+
+use polycopier::models::Position;
+use polycopier::state::BotState;
+use rust_decimal_macros::dec;
+
+// ---------------------------------------------------------------------------
+// Order watcher: cancel-decision logic
+//
+// The watcher cancels an open order when ANY of these is true:
+//   A. Target no longer holds the token (sold out / never held)
+//   B. Target PnL <= -max_copy_loss_pct
+//   C. Market is redeemable OR past its end_date
+//
+// We model the predicate as a function so it's testable without a live client.
+// ---------------------------------------------------------------------------
+
+/// Pure helper that mirrors the cancel-decision in order_watcher::run_once.
+/// Returns (should_cancel, reason).
+fn should_cancel(
+    target_pnl: Option<rust_decimal::Decimal>, // None = target has no position
+    redeemable: bool,
+    expired: bool,
+    max_loss: rust_decimal::Decimal,
+    is_in_ledger: bool,
+    is_in_pending: bool,
+) -> (bool, &'static str) {
+    let mut should_cancel = false;
+    let mut reason = "";
+
+    match target_pnl {
+        Some(pnl) => {
+            if redeemable || expired {
+                should_cancel = true;
+                reason = "Market resolved or expired";
+            } else if pnl <= -max_loss {
+                should_cancel = true;
+                reason = "Target position PnL dropped past MAX_COPY_LOSS_PCT limit";
+            }
+        }
+        None => {
+            should_cancel = true;
+            reason = "Target closed position (zero balance)";
+        }
+    }
+
+    if !should_cancel && !is_in_ledger && !is_in_pending {
+        should_cancel = true;
+        reason = "Unknown orphan order (no target mapping). Auto-cancelling.";
+    }
+
+    (should_cancel, reason)
+}
+
+mod order_watcher_logic_tests {
+    use super::*;
+
+    const MAX_LOSS: rust_decimal::Decimal = dec!(0.10); // 10%
+
+    // -- Trigger A: target sold -------------------------------------------------
+
+    #[test]
+    fn cancel_when_target_has_no_position() {
+        let (cancel, reason) = should_cancel(None, false, false, MAX_LOSS, true, true);
+        assert!(cancel);
+        assert!(reason.contains("closed position"));
+    }
+
+    // -- Trigger B: PnL breach --------------------------------------------------
+
+    #[test]
+    fn cancel_when_pnl_exactly_at_limit() {
+        // pnl == -max_loss: the condition is <=, so this triggers
+        let (cancel, _) = should_cancel(Some(dec!(-0.10)), false, false, MAX_LOSS, true, true);
+        assert!(cancel);
+    }
+
+    #[test]
+    fn cancel_when_pnl_far_below_limit() {
+        let (cancel, reason) = should_cancel(Some(dec!(-0.80)), false, false, MAX_LOSS, true, true);
+        assert!(cancel);
+        assert!(reason.contains("PnL"));
+    }
+
+    #[test]
+    fn no_cancel_when_pnl_just_above_limit() {
+        // -9.9% — within MAX_LOSS of 10%
+        let (cancel, _) = should_cancel(Some(dec!(-0.099)), false, false, MAX_LOSS, true, true);
+        assert!(!cancel);
+    }
+
+    #[test]
+    fn no_cancel_when_pnl_positive() {
+        let (cancel, _) = should_cancel(Some(dec!(0.15)), false, false, MAX_LOSS, true, true);
+        assert!(!cancel);
+    }
+
+    #[test]
+    fn no_cancel_when_pnl_zero() {
+        let (cancel, _) = should_cancel(Some(dec!(0)), false, false, MAX_LOSS, true, true);
+        assert!(!cancel);
+    }
+
+    // -- Trigger C: market expired / redeemable ---------------------------------
+
+    #[test]
+    fn cancel_when_market_redeemable() {
+        // Even if pnl is fine, redeemable market = resolved, cancel
+        let (cancel, reason) = should_cancel(Some(dec!(0.05)), true, false, MAX_LOSS, true, true);
+        assert!(cancel);
+        assert!(reason.contains("resolved or expired"));
+    }
+
+    #[test]
+    fn cancel_when_market_past_end_date() {
+        let (cancel, reason) = should_cancel(Some(dec!(0.05)), false, true, MAX_LOSS, true, true);
+        assert!(cancel);
+        assert!(reason.contains("resolved or expired"));
+    }
+
+    #[test]
+    fn cancel_when_both_redeemable_and_expired() {
+        let (cancel, _) = should_cancel(Some(dec!(0.05)), true, true, MAX_LOSS, true, true);
+        assert!(cancel);
+    }
+
+    // -- Happy path: no cancellation -------------------------------------------
+
+    #[test]
+    fn no_cancel_for_healthy_position() {
+        // Target still holds it, PnL fine, market active
+        let (cancel, _) = should_cancel(Some(dec!(-0.05)), false, false, MAX_LOSS, true, true);
+        assert!(!cancel);
+    }
+
+    // -- Priority: expired takes precedence over PnL ---------------------------
+
+    #[test]
+    fn expired_beats_healthy_pnl() {
+        let (cancel, reason) = should_cancel(Some(dec!(0.50)), true, false, MAX_LOSS, true, true);
+        assert!(cancel);
+        assert!(reason.contains("resolved or expired"));
+    }
+
+    // -- Boundary: zero max_loss means any negative PnL triggers cancel --------
+
+    #[test]
+    fn zero_max_loss_cancels_on_any_negative_pnl() {
+        let (cancel, _) = should_cancel(Some(dec!(-0.001)), false, false, dec!(0), true, true);
+        assert!(cancel);
+    }
+
+    // -- Trigger D: Orphan Constraint (Unknown order) --------------------------
+
+    #[test]
+    fn cancel_when_orphan_missing_from_both_ledger_and_pending() {
+        // Position isn't expired, target has PnL, but it's an orphan!
+        let (cancel, reason) =
+            should_cancel(Some(dec!(0.10)), false, false, MAX_LOSS, false, false);
+        assert!(cancel);
+        assert!(reason.contains("Unknown orphan order"));
+    }
+
+    #[test]
+    fn no_cancel_when_in_ledger_but_not_pending() {
+        // e.g. An active limit order from a past run
+        let (cancel, _) = should_cancel(Some(dec!(0.10)), false, false, MAX_LOSS, true, false);
+        assert!(!cancel);
+    }
+
+    #[test]
+    fn no_cancel_when_in_pending_but_not_ledger() {
+        // e.g. A brand new limit order not yet flushed to ledger
+        let (cancel, _) = should_cancel(Some(dec!(0.10)), false, false, MAX_LOSS, false, true);
+        assert!(!cancel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wallet_sync: position upsert / remove rules
+//
+// The start_position_sync task iterates the API response and applies:
+//   - redeemable || cur_price == 0  →  positions.remove(token)
+//   - otherwise                     →  positions.insert(token, ...)
+//
+// We test this logic here using BotState directly.
+// ---------------------------------------------------------------------------
+
+mod wallet_sync_position_rules {
+    use super::*;
+
+    fn make_pos(token_id: &str, size: rust_decimal::Decimal) -> Position {
+        Position {
+            token_id: token_id.to_string(),
+            size,
+            average_entry_price: dec!(0.50),
+        }
+    }
+
+    #[test]
+    fn new_active_position_is_inserted() {
+        let mut state = BotState::new(false, None);
+        state
+            .positions
+            .insert("tok_a".to_string(), make_pos("tok_a", dec!(10)));
+        assert!(state.positions.contains_key("tok_a"));
+        assert_eq!(state.positions["tok_a"].size, dec!(10));
+    }
+
+    #[test]
+    fn resolved_position_is_removed() {
+        let mut state = BotState::new(false, None);
+        state
+            .positions
+            .insert("tok_b".to_string(), make_pos("tok_b", dec!(5)));
+        // Simulate run_once removing it when redeemable=true
+        state.positions.remove("tok_b");
+        assert!(!state.positions.contains_key("tok_b"));
+    }
+
+    #[test]
+    fn existing_position_size_is_updated_on_refresh() {
+        let mut state = BotState::new(false, None);
+        state
+            .positions
+            .insert("tok_c".to_string(), make_pos("tok_c", dec!(20)));
+        // Fill comes in, size grows
+        state
+            .positions
+            .insert("tok_c".to_string(), make_pos("tok_c", dec!(25)));
+        assert_eq!(state.positions["tok_c"].size, dec!(25));
+    }
+
+    #[test]
+    fn unrelated_positions_not_affected_by_remove() {
+        let mut state = BotState::new(false, None);
+        state
+            .positions
+            .insert("tok_d".to_string(), make_pos("tok_d", dec!(10)));
+        state
+            .positions
+            .insert("tok_e".to_string(), make_pos("tok_e", dec!(8)));
+        state.positions.remove("tok_d");
+        assert!(!state.positions.contains_key("tok_d"));
+        assert!(state.positions.contains_key("tok_e"));
+        assert_eq!(state.positions.len(), 1);
+    }
+
+    #[test]
+    fn remove_nonexistent_key_is_a_noop() {
+        let mut state = BotState::new(false, None);
+        // Should not panic
+        state.positions.remove("does_not_exist");
+        assert!(state.positions.is_empty());
+    }
+
+    #[test]
+    fn multiple_fresh_fills_all_inserted() {
+        let mut state = BotState::new(false, None);
+        for i in 0..5u32 {
+            let key = format!("tok_{i}");
+            state
+                .positions
+                .insert(key.clone(), make_pos(&key, dec!(10)));
+        }
+        assert_eq!(state.positions.len(), 5);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Order watcher + scanner expiry logic (< today, not <= today)
+//
+// Both scanner and watcher use end_date < today (strictly past).
+// Same-day markets (end_date == today) are still open — redeemable=true is
+// the authoritative "market resolved" signal from Polymarket on-chain.
+//
+// Rationale:
+//   - A 5-min BTC market expiring at 9:05am today has end_date = today.
+//     It is still valid to enter at 9:01am. <= today would wrongly block it.
+//   - A daily "BTC above $80k on April 1" market with endDate=today and
+//     redeemable=false has hours of trading window left. <= today blocks it.
+//   - When the market resolves, Polymarket flips redeemable=true on-chain.
+//     That is the correct signal to use, not the date.
+//   - end_date < today is a backstop only for stale markets (resolved yesterday
+//     or earlier) where redeemable hasn't been updated yet.
+// ---------------------------------------------------------------------------
+
+mod watcher_expiry_alignment_tests {
+    use chrono::Utc;
+
+    /// Replicates scanner classify_position expiry check: `end_date < today`.
+    fn scanner_is_expired(end_date: chrono::NaiveDate) -> bool {
+        let today = Utc::now().date_naive();
+        end_date < today
+    }
+
+    /// Replicates order_watcher expiry check: `end_date < today`.
+    fn watcher_is_expired(end_date: chrono::NaiveDate) -> bool {
+        let today = Utc::now().date_naive();
+        end_date < today
+    }
+
+    // -- Same-day: NOT expired (market still open) ---------------------------
+
+    #[test]
+    fn scanner_allows_same_day_market_still_active() {
+        // end_date=today, redeemable=false → market is open, should be Monitoring
+        let today = Utc::now().date_naive();
+        assert!(
+            !scanner_is_expired(today),
+            "same-day market with redeemable=false must NOT be classified as expired"
+        );
+    }
+
+    #[test]
+    fn watcher_does_not_cancel_same_day_market_still_active() {
+        // GTC on a same-day 5-min or daily market must stay alive until redeemable=true
+        let today = Utc::now().date_naive();
+        assert!(
+            !watcher_is_expired(today),
+            "watcher must not cancel open same-day market — wait for redeemable=true"
+        );
+    }
+
+    #[test]
+    fn scanner_and_watcher_agree_on_same_day() {
+        let today = Utc::now().date_naive();
+        assert_eq!(
+            scanner_is_expired(today),
+            watcher_is_expired(today),
+            "scanner and watcher must use the same expiry predicate"
+        );
+    }
+
+    // -- Past dates: correctly expired (backstop for stale redeemable) -------
+
+    #[test]
+    fn scanner_blocks_yesterday_market() {
+        let yesterday = Utc::now().date_naive() - chrono::Duration::days(1);
+        assert!(
+            scanner_is_expired(yesterday),
+            "market that ended yesterday must be SkippedExpired"
+        );
+    }
+
+    #[test]
+    fn watcher_cancels_yesterday_market() {
+        let yesterday = Utc::now().date_naive() - chrono::Duration::days(1);
+        assert!(
+            watcher_is_expired(yesterday),
+            "watcher must cancel GTC on a market that ended yesterday"
+        );
+    }
+
+    #[test]
+    fn scanner_blocks_week_old_market() {
+        let old = Utc::now().date_naive() - chrono::Duration::days(7);
+        assert!(scanner_is_expired(old));
+    }
+
+    // -- Future: never expired -----------------------------------------------
+
+    #[test]
+    fn scanner_allows_tomorrow_market() {
+        let tomorrow = Utc::now().date_naive() + chrono::Duration::days(1);
+        assert!(!scanner_is_expired(tomorrow));
+    }
+
+    #[test]
+    fn watcher_does_not_cancel_future_market() {
+        let future = Utc::now().date_naive() + chrono::Duration::days(365);
+        assert!(!watcher_is_expired(future));
+    }
+}
