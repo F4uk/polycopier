@@ -176,8 +176,43 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
   and each target wallet directly via the API every 30 seconds and computes the
   intersection. Never based on session state or scanner timing.
 
-- **Pre-commit quality gates** - `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
+- **Pre-commit quality gates** — `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
   run automatically before every commit via `.githooks/pre-commit`.
+
+- **AI Risk Control API** — an embedded HTTP server listens on `127.0.0.1:8989` and
+  exposes two endpoints for external AI agents or scripts to control the bot:
+  - `POST /ai/close` — immediately cancel all pending orders and close all open positions
+    via market orders; the bot resumes listening after cooldown.
+  - `POST /ai/freeze` — set a temporary freeze (default 5 minutes) that blocks all BUY
+    orders. Use this to stop new entries while allowing existing positions to close normally.
+  Control via curl:
+  ```bash
+  curl -X POST http://127.0.0.1:8989/ai/close
+  curl -X POST http://127.0.0.1:8989/ai/freeze
+  ```
+  The freeze timer resets on every new freeze request (last caller wins).
+  Configure the port via `AI_API_PORT` in `.env` (default `8989`).
+
+- **Slippage Guard** — on every BUY entry, the bot checks the current market spread:
+  - Rejects orders if the bid-ask spread exceeds **2.5%** of mid-price.
+  - Applies a **+0.5% limit-price premium** on BUY (pays at most `mid × 1.005`).
+  - On SELL, the spread guard is skipped since the bot is always the taker.
+  - A **depth guard** further rejects entries if the top-5 order-book levels represent
+    less than **$2,000 combined liquidity** at the entry price (prevents thin-market slippage).
+
+- **Wash Trade Filter** — detects and rejects coordinated wash-trading patterns where the
+  same address executes ≥ **3 trades on the same token within 60 seconds**. Such patterns
+  are a common signal of artificial volume used to attract Polymarket's copy-trading
+  signal. Detected trades are logged and skipped; the address remains monitored.
+
+- **Local Stop-Loss & Take-Profit** — a background task monitors all open positions
+  against configurable thresholds (disabled by default):
+  - **Stop-loss**: exits via market order if price falls below
+    `entry_price × (1 − stop_loss_pct)`.
+  - **Take-profit**: exits via market order if price rises above
+    `entry_price × (1 + take_profit_pct)`.
+  Both triggers check every N seconds (configurable) and record exits in the copy ledger.
+  Configure via the `[stop_loss]` section in `config.toml`.
 
 ---
 
@@ -282,6 +317,23 @@ On first run, if `config.toml` is missing the bot auto-generates it from default
 | Key | Default | Description |
 |---|---|---|
 | `retention_days` | `90` | Days to keep closed trade entries before pruning on startup. `0` = never prune |
+
+#### `[stop_loss]`
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Enable local stop-loss and take-profit monitoring |
+| `stop_loss_pct` | `0.15` | Exit if price falls below `entry × (1 − stop_loss_pct)` (15% = `0.15`) |
+| `take_profit_pct` | `0.30` | Exit if price rises above `entry × (1 + take_profit_pct)` (30% = `0.30`) |
+| `check_interval_secs` | `3` | Seconds between background checks of all open positions |
+
+#### AI Risk Control API
+
+The AI API runs on `127.0.0.1:8989` by default. Configure via `.env`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `AI_API_PORT` | `8989` | HTTP server port for AI risk control endpoints |
 
 ### Wallet Type
 
@@ -492,10 +544,24 @@ main.rs
   |                        - survives restarts; reconciled against live wallet on boot
   |
   +-- strategy.rs         Receives TradeEvents, queries live API + ledger for intent,
-  |                        applies risk checks, submits orders via OrderSubmitter
+  |                        applies risk checks, submits orders via OrderSubmitter;
+  |                        integrates slippage_guard, wash_trade_filter, freeze_guard,
+  |                        and stop_loss record_entry
   |
   +-- risk.rs             RiskEngine: micro-trade filter, daily volume cap,
   |                        consecutive-loss circuit breaker, rapid-flip guard (60s per token)
+  |
+  +-- api_control.rs      AI Risk Control HTTP server (127.0.0.1:8989):
+  |                        POST /ai/close (close all + cooldown),
+  |                        POST /ai/freeze (block BUY for duration)
+  |
+  +-- slippage_guard.rs  Spread check (>2.5% reject), limit-price premium (+0.5%),
+  |                        depth guard (<$2000 reject) — BUY entries only
+  |
+  +-- wash_trade_filter.rs Same-address / same-token / ≥3 trades / 60s detection
+  |
+  +-- stop_loss.rs       Background monitor: stop-loss and take-profit exits
+  |                        via market orders, records in copy ledger
   |
   +-- state.rs            Shared BotState (Arc<RwLock<_>>): balance, our positions,
   |                        target positions, live feed, TUI counters, refresh timestamps
