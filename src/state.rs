@@ -11,6 +11,34 @@ pub struct WalletStats {
     pub wins: u32,
     pub losses: u32,
     pub total_pnl: Decimal,
+    /// Consecutive losses currently (reset on win).
+    pub consecutive_losses: u32,
+}
+
+/// Performance metrics tracked in real-time.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PerfMetrics {
+    /// When the bot started (Unix timestamp).
+    pub started_at_secs: u64,
+    /// Number of API calls made today (reset at UTC midnight).
+    pub today_api_calls: u64,
+    /// Last measured API latency in milliseconds.
+    pub last_api_latency_ms: u64,
+    /// Average API latency over last 10 calls.
+    pub avg_api_latency_ms: u64,
+    /// Last measured copy-trade latency in milliseconds (time from WS event to order submit).
+    pub last_copy_latency_ms: u64,
+    /// Average copy latency over last 10 calls.
+    pub avg_copy_latency_ms: u64,
+}
+
+/// PnL snapshot for equity curve charting.
+#[derive(Debug, Clone, Serialize)]
+pub struct PnlSnapshot {
+    pub timestamp_secs: u64,
+    pub realized_pnl: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub total_balance: Decimal,
 }
 
 pub struct BotState {
@@ -57,6 +85,18 @@ pub struct BotState {
     pub today_date: String,
     /// When the trading freeze (from /ai/freeze) expires. None = not frozen.
     pub freeze_until: Option<Instant>,
+    /// Today's cumulative realized loss (reset at UTC midnight). Used for daily loss circuit-breaker.
+    pub today_realized_loss: Decimal,
+    /// Starting balance at UTC midnight (for daily loss % calculation).
+    pub daily_start_balance: Decimal,
+    /// Whether daily loss circuit-breaker has been triggered.
+    pub daily_loss_triggered: bool,
+    /// Wallet addresses that are temporarily blacklisted from copy-trading.
+    pub wallet_blacklist: HashSet<String>,
+    /// Performance metrics for the monitoring panel.
+    pub perf: PerfMetrics,
+    /// PnL snapshots for equity curve (sampled every 60s).
+    pub pnl_history: Vec<PnlSnapshot>,
 }
 
 const MUTED_FILE: &str = "muted_markets.json";
@@ -108,6 +148,18 @@ impl BotState {
             today_pnl: Decimal::from(0),
             today_date: chrono::Utc::now().date_naive().to_string(),
             freeze_until: None,
+            today_realized_loss: Decimal::ZERO,
+            daily_start_balance: initial_balance,
+            daily_loss_triggered: false,
+            wallet_blacklist: HashSet::new(),
+            perf: PerfMetrics {
+                started_at_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                ..Default::default()
+            },
+            pnl_history: Vec::new(),
         }
     }
 
@@ -143,9 +195,11 @@ impl BotState {
         stats.total_copies += 1;
         stats.wins += 1;
         stats.total_pnl += pnl;
+        stats.consecutive_losses = 0; // reset on win
         self.today_copies += 1;
         self.today_wins += 1;
         self.today_pnl += pnl;
+        // If pnl > 0, it's a realized gain — no loss tracking needed
         self.maybe_reset_today();
     }
 
@@ -155,10 +209,117 @@ impl BotState {
         stats.total_copies += 1;
         stats.losses += 1;
         stats.total_pnl += pnl;
+        stats.consecutive_losses += 1;
         self.today_copies += 1;
         self.today_losses += 1;
         self.today_pnl += pnl;
+        // Track realized loss for daily circuit-breaker
+        if pnl < Decimal::ZERO {
+            self.today_realized_loss += pnl.abs();
+        }
         self.maybe_reset_today();
+    }
+
+    /// Check if daily loss circuit-breaker should trigger.
+    /// Returns true if today's realized loss exceeds max_daily_loss_pct of starting balance.
+    pub fn check_daily_loss_circuit_breaker(&mut self, max_daily_loss_pct: Decimal) -> bool {
+        if max_daily_loss_pct <= Decimal::ZERO || self.daily_start_balance <= Decimal::ZERO {
+            return false;
+        }
+        let threshold = self.daily_start_balance * max_daily_loss_pct;
+        if self.today_realized_loss >= threshold && !self.daily_loss_triggered {
+            self.daily_loss_triggered = true;
+            tracing::warn!(
+                "[RiskGuard] Daily loss circuit-breaker triggered: loss={} >= threshold={}",
+                self.today_realized_loss,
+                threshold
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Check if a wallet should be auto-blacklisted based on consecutive losses or win rate.
+    /// Returns true if the wallet was newly blacklisted.
+    pub fn check_wallet_blacklist(
+        &mut self,
+        wallet: &str,
+        max_consecutive: u32,
+        min_win_rate: Decimal,
+    ) -> bool {
+        let key = wallet.to_lowercase();
+        if self.wallet_blacklist.contains(&key) {
+            return false;
+        }
+        let stats = match self.wallet_stats.get(&key) {
+            Some(s) => s,
+            None => return false,
+        };
+        let should_blacklist = if max_consecutive > 0 && stats.consecutive_losses >= max_consecutive
+        {
+            true
+        } else if min_win_rate > Decimal::ZERO && stats.wins + stats.losses >= 3 {
+            let win_rate = if stats.wins + stats.losses > 0 {
+                Decimal::from(stats.wins) / Decimal::from(stats.wins + stats.losses)
+            } else {
+                Decimal::ONE
+            };
+            win_rate < min_win_rate
+        } else {
+            false
+        };
+        if should_blacklist {
+            self.wallet_blacklist.insert(key.clone());
+            tracing::warn!(
+                "[RiskGuard] Wallet {} auto-blacklisted (consecutive_losses={}, win_rate={:.1}%)",
+                &key[..key.len().min(10)],
+                stats.consecutive_losses,
+                if stats.wins + stats.losses > 0 {
+                    stats.wins as f64 / (stats.wins + stats.losses) as f64 * 100.0
+                } else {
+                    0.0
+                }
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Whether the given wallet is currently blacklisted.
+    pub fn is_wallet_blacklisted(&self, wallet: &str) -> bool {
+        self.wallet_blacklist.contains(&wallet.to_lowercase())
+    }
+
+    /// Record an API call for performance tracking.
+    pub fn record_api_call(&mut self, latency_ms: u64) {
+        self.perf.today_api_calls += 1;
+        self.perf.last_api_latency_ms = latency_ms;
+        // Running average over last 10 calls
+        self.perf.avg_api_latency_ms = (self.perf.avg_api_latency_ms * 9 + latency_ms) / 10;
+    }
+
+    /// Record a copy-trade latency measurement.
+    pub fn record_copy_latency(&mut self, latency_ms: u64) {
+        self.perf.last_copy_latency_ms = latency_ms;
+        self.perf.avg_copy_latency_ms = (self.perf.avg_copy_latency_ms * 9 + latency_ms) / 10;
+    }
+
+    /// Record a PnL snapshot for the equity curve.
+    pub fn record_pnl_snapshot(&mut self) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.pnl_history.push(PnlSnapshot {
+            timestamp_secs: now_secs,
+            realized_pnl: self.realized_pnl,
+            unrealized_pnl: self.unrealized_pnl,
+            total_balance: self.total_balance,
+        });
+        // Keep last 1440 snapshots (24h at 60s intervals)
+        if self.pnl_history.len() > 1440 {
+            self.pnl_history.remove(0);
+        }
     }
 
     fn maybe_reset_today(&mut self) {
@@ -168,6 +329,10 @@ impl BotState {
             self.today_wins = 0;
             self.today_losses = 0;
             self.today_pnl = Decimal::from(0);
+            self.today_realized_loss = Decimal::ZERO;
+            self.daily_start_balance = self.total_balance;
+            self.daily_loss_triggered = false;
+            self.perf.today_api_calls = 0;
             self.today_date = today;
         }
     }

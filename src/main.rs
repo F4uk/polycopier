@@ -15,6 +15,7 @@ pub mod slippage_guard;
 pub mod state;
 pub mod stop_loss;
 pub mod strategy;
+pub mod telegram;
 pub mod ui;
 pub mod utils;
 pub mod wallet_sync;
@@ -337,6 +338,9 @@ async fn main() -> anyhow::Result<()> {
         submitter_for_stop_loss,
         config.clone(),
     );
+
+    // ── PnL sampler + Telegram notifier + circuit-breaker ──────────────────
+    telegram::start_pnl_sampler(state.clone(), config.clone());
 
     if is_ui {
         tokio::spawn(async move {

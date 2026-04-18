@@ -44,6 +44,9 @@ pub struct BotConfig {
     pub risk: RiskConfig,
     pub ledger: LedgerConfig,
     pub stop_loss: StopLossConfig,
+    pub risk_guard: RiskGuardConfig,
+    pub market_filter: MarketFilterConfig,
+    pub telegram: TelegramConfig,
 }
 
 /// Copy-trade target wallets — public on-chain addresses, safe in config.toml.
@@ -118,6 +121,45 @@ pub struct StopLossConfig {
     pub check_interval_secs: u64,
 }
 
+/// Enhanced risk guard config: daily loss circuit-breaker + per-trade cap + wallet blacklist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskGuardConfig {
+    /// Max daily loss as fraction of starting balance (0.15 = 15%). Triggers auto-close + freeze.
+    pub max_daily_loss_pct: Decimal,
+    /// Max absolute USD loss per single trade before force-sell. 0 = disabled.
+    pub max_single_loss_usd: Decimal,
+    /// Consecutive losses from one wallet before auto-blacklisting. 0 = disabled.
+    pub wallet_blacklist_consecutive_losses: u32,
+    /// Win rate below this fraction triggers wallet blacklisting. 0 = disabled.
+    pub wallet_blacklist_min_win_rate: Decimal,
+}
+
+/// Market quality filter config: auto-skip low-quality / irrelevant markets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketFilterConfig {
+    /// Market categories to always skip (e.g. ["tennis", "sports", "esports", "gaming", "ball"]).
+    pub category_blacklist: Vec<String>,
+    /// Skip markets ending within this many hours. 0 = disabled.
+    pub min_hours_to_expiry: Decimal,
+    /// Min 1h volume in USD. Markets below are skipped. 0 = disabled.
+    pub min_volume_1h_usd: Decimal,
+    /// Max bid-ask spread (0.02 = 2%). Markets above are skipped. 0 = disabled.
+    pub max_spread_pct: Decimal,
+    /// Min number of holders. Markets below are skipped. 0 = disabled.
+    pub min_holders: u32,
+}
+
+/// Telegram notification config (optional).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    /// Bot token from @BotFather. Empty = disabled.
+    pub bot_token: String,
+    /// Chat ID to send messages to. Empty = disabled.
+    pub chat_id: String,
+    /// Minimum PnL event to trigger a notification (in USD). 0 = all events.
+    pub min_pnl_usd: Decimal,
+}
+
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
@@ -151,6 +193,30 @@ impl Default for BotConfig {
                 stop_loss_pct: Decimal::from_str("0.15").unwrap(),
                 take_profit_pct: Decimal::from_str("0.30").unwrap(),
                 check_interval_secs: 60,
+            },
+            risk_guard: RiskGuardConfig {
+                max_daily_loss_pct: Decimal::from_str("0.15").unwrap(),
+                max_single_loss_usd: Decimal::from_str("5.0").unwrap(),
+                wallet_blacklist_consecutive_losses: 3,
+                wallet_blacklist_min_win_rate: Decimal::from_str("0.40").unwrap(),
+            },
+            market_filter: MarketFilterConfig {
+                category_blacklist: vec![
+                    "tennis".into(),
+                    "sports".into(),
+                    "esports".into(),
+                    "gaming".into(),
+                    "ball".into(),
+                ],
+                min_hours_to_expiry: Decimal::from_str("24").unwrap(),
+                min_volume_1h_usd: Decimal::from_str("1000").unwrap(),
+                max_spread_pct: Decimal::from_str("0.02").unwrap(),
+                min_holders: 50,
+            },
+            telegram: TelegramConfig {
+                bot_token: String::new(),
+                chat_id: String::new(),
+                min_pnl_usd: Decimal::ZERO,
             },
         }
     }
@@ -196,6 +262,21 @@ pub struct Config {
     pub stop_loss_pct: Decimal,
     pub take_profit_pct: Decimal,
     pub stop_loss_check_interval_secs: u64,
+    // Risk guard tunables
+    pub max_daily_loss_pct: Decimal,
+    pub max_single_loss_usd: Decimal,
+    pub wallet_blacklist_consecutive_losses: u32,
+    pub wallet_blacklist_min_win_rate: Decimal,
+    // Market filter tunables
+    pub category_blacklist: Vec<String>,
+    pub min_hours_to_expiry: Decimal,
+    pub min_volume_1h_usd: Decimal,
+    pub max_spread_pct: Decimal,
+    pub min_holders: u32,
+    // Telegram
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
+    pub telegram_min_pnl_usd: Decimal,
     pub is_sim: bool,
     pub sim_balance: Option<rust_decimal::Decimal>,
 }
@@ -233,6 +314,16 @@ fn load_toml() -> Option<BotConfig> {
             tracing::warn!("config.toml parse error — using defaults: {e}");
             None
         }
+    }
+}
+
+/// Format a `Vec<String>` as a TOML inline array string literal.
+fn format_toml_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "[]".to_string()
+    } else {
+        let quoted: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
+        format!("[{}]", quoted.join(", "))
     }
 }
 
@@ -310,6 +401,36 @@ stop_loss_pct = {sl_pct}
 take_profit_pct = {tp_pct}
 # How often (seconds) to check price levels
 check_interval_secs = {sl_interval}
+
+[risk_guard]
+# Max daily loss as fraction of starting balance (0.15 = 15%). Triggers auto-close + freeze.
+max_daily_loss_pct = {rg_daily_loss}
+# Max absolute USD loss per single trade. 0 = disabled.
+max_single_loss_usd = {rg_single_loss}
+# Consecutive losses from one wallet before auto-blacklisting. 0 = disabled.
+wallet_blacklist_consecutive_losses = {rg_consec}
+# Win rate below this fraction triggers wallet blacklisting. 0 = disabled.
+wallet_blacklist_min_win_rate = {rg_wr}
+
+[market_filter]
+# Market categories to always skip (e.g. tennis, sports, esports, gaming, ball)
+category_blacklist = {cat_bl}
+# Skip markets ending within this many hours. 0 = disabled.
+min_hours_to_expiry = {mf_expiry}
+# Min 1h volume in USD. Markets below are skipped. 0 = disabled.
+min_volume_1h_usd = {mf_vol}
+# Max bid-ask spread (0.02 = 2%). Markets above are skipped. 0 = disabled.
+max_spread_pct = {mf_spread}
+# Min number of holders. Markets below are skipped. 0 = disabled.
+min_holders = {mf_holders}
+
+[telegram]
+# Bot token from @BotFather. Empty = disabled.
+bot_token = "{tg_token}"
+# Chat ID to send messages to. Empty = disabled.
+chat_id = "{tg_chat}"
+# Minimum PnL event to trigger notification (USD). 0 = all events.
+min_pnl_usd = {tg_pnl}
 "#,
         wallets = wallets_toml,
         slippage = cfg.execution.max_slippage_pct,
@@ -338,6 +459,18 @@ check_interval_secs = {sl_interval}
         sl_pct = cfg.stop_loss.stop_loss_pct,
         tp_pct = cfg.stop_loss.take_profit_pct,
         sl_interval = cfg.stop_loss.check_interval_secs,
+        rg_daily_loss = cfg.risk_guard.max_daily_loss_pct,
+        rg_single_loss = cfg.risk_guard.max_single_loss_usd,
+        rg_consec = cfg.risk_guard.wallet_blacklist_consecutive_losses,
+        rg_wr = cfg.risk_guard.wallet_blacklist_min_win_rate,
+        cat_bl = format_toml_list(&cfg.market_filter.category_blacklist),
+        mf_expiry = cfg.market_filter.min_hours_to_expiry,
+        mf_vol = cfg.market_filter.min_volume_1h_usd,
+        mf_spread = cfg.market_filter.max_spread_pct,
+        mf_holders = cfg.market_filter.min_holders,
+        tg_token = cfg.telegram.bot_token,
+        tg_chat = cfg.telegram.chat_id,
+        tg_pnl = cfg.telegram.min_pnl_usd,
     );
     fs::write(CONFIG_TOML_PATH, content)?;
     Ok(())
@@ -466,6 +599,39 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
                 "STOP_LOSS_CHECK_INTERVAL_SECS",
                 defaults.stop_loss.check_interval_secs,
             ),
+        },
+        risk_guard: RiskGuardConfig {
+            max_daily_loss_pct: dec("MAX_DAILY_LOSS_PCT", defaults.risk_guard.max_daily_loss_pct),
+            max_single_loss_usd: dec(
+                "MAX_SINGLE_LOSS_USD",
+                defaults.risk_guard.max_single_loss_usd,
+            ),
+            wallet_blacklist_consecutive_losses: u32v(
+                "WALLET_BLACKLIST_CONSECUTIVE_LOSSES",
+                defaults.risk_guard.wallet_blacklist_consecutive_losses,
+            ),
+            wallet_blacklist_min_win_rate: dec(
+                "WALLET_BLACKLIST_MIN_WIN_RATE",
+                defaults.risk_guard.wallet_blacklist_min_win_rate,
+            ),
+        },
+        market_filter: MarketFilterConfig {
+            category_blacklist: defaults.market_filter.category_blacklist.clone(),
+            min_hours_to_expiry: dec(
+                "MIN_HOURS_TO_EXPIRY",
+                defaults.market_filter.min_hours_to_expiry,
+            ),
+            min_volume_1h_usd: dec(
+                "MIN_VOLUME_1H_USD",
+                defaults.market_filter.min_volume_1h_usd,
+            ),
+            max_spread_pct: dec("MAX_SPREAD_PCT", defaults.market_filter.max_spread_pct),
+            min_holders: u32v("MIN_HOLDERS", defaults.market_filter.min_holders),
+        },
+        telegram: TelegramConfig {
+            bot_token: e("TELEGRAM_BOT_TOKEN"),
+            chat_id: e("TELEGRAM_CHAT_ID"),
+            min_pnl_usd: dec("TELEGRAM_MIN_PNL_USD", defaults.telegram.min_pnl_usd),
         },
     }
 }
@@ -683,6 +849,18 @@ impl Config {
             stop_loss_pct: cfg.stop_loss.stop_loss_pct,
             take_profit_pct: cfg.stop_loss.take_profit_pct,
             stop_loss_check_interval_secs: cfg.stop_loss.check_interval_secs,
+            max_daily_loss_pct: cfg.risk_guard.max_daily_loss_pct,
+            max_single_loss_usd: cfg.risk_guard.max_single_loss_usd,
+            wallet_blacklist_consecutive_losses: cfg.risk_guard.wallet_blacklist_consecutive_losses,
+            wallet_blacklist_min_win_rate: cfg.risk_guard.wallet_blacklist_min_win_rate,
+            category_blacklist: cfg.market_filter.category_blacklist,
+            min_hours_to_expiry: cfg.market_filter.min_hours_to_expiry,
+            min_volume_1h_usd: cfg.market_filter.min_volume_1h_usd,
+            max_spread_pct: cfg.market_filter.max_spread_pct,
+            min_holders: cfg.market_filter.min_holders,
+            telegram_bot_token: cfg.telegram.bot_token,
+            telegram_chat_id: cfg.telegram.chat_id,
+            telegram_min_pnl_usd: cfg.telegram.min_pnl_usd,
             is_sim: false, // Injected dynamically in Config::load_or_prompt wrapper
             sim_balance: None,
         }

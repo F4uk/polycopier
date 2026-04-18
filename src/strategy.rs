@@ -419,6 +419,55 @@ pub fn start_strategy_engine(
                 }
             }
 
+            // 6. Wallet blacklist check — skip if wallet is auto-blacklisted
+            if eval.validated {
+                let is_blacklisted = {
+                    let guard = state.read().await;
+                    guard.is_wallet_blacklisted(&event.taker_address)
+                };
+                if is_blacklisted {
+                    eval.validated = false;
+                    eval.reason = Some("Wallet is blacklisted (poor performance)".to_string());
+                }
+            }
+
+            // 7. Daily loss circuit-breaker — block all BUYs if triggered
+            if eval.validated && event.side == TradeSide::BUY {
+                let (loss_triggered, _max_daily_loss_pct) = {
+                    let guard = state.read().await;
+                    (guard.daily_loss_triggered, config.max_daily_loss_pct)
+                };
+                if loss_triggered {
+                    eval.validated = false;
+                    eval.reason =
+                        Some("Daily loss circuit-breaker triggered — BUYs blocked".to_string());
+                }
+            }
+
+            // 8. Market category blacklist — skip if market title matches blacklisted category
+            if eval.validated
+                && event.side == TradeSide::BUY
+                && !config.category_blacklist.is_empty()
+            {
+                let title = {
+                    let guard = state.read().await;
+                    guard
+                        .target_positions
+                        .iter()
+                        .find(|p| p.token_id == event.token_id)
+                        .map(|p| p.title.to_lowercase())
+                        .unwrap_or_default()
+                };
+                let blocked = config
+                    .category_blacklist
+                    .iter()
+                    .any(|cat| title.contains(&cat.to_lowercase()));
+                if blocked {
+                    eval.validated = false;
+                    eval.reason = Some("Market category is blacklisted".to_string());
+                }
+            }
+
             // -- Intent classification: live API + copy ledger ------------------
             //
             // Rules:

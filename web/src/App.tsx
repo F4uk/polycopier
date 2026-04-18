@@ -3,6 +3,27 @@ import SettingsManager from './SettingsManager';
 import SetupWizard from './SetupWizard';
 import AiPanel from './AiPanel';
 
+function QuickActionButton({ label, color, onClick }: { label: string; color: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        padding: '4px 10px',
+        fontSize: '0.7rem',
+        fontWeight: 600,
+        background: `${color}22`,
+        border: `1px solid ${color}66`,
+        borderRadius: '4px',
+        color,
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
 function App() {
   const [state, setState] = useState<any>(null);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'settings' | 'ai'>('dashboard');
@@ -129,6 +150,15 @@ function App() {
             <span className="stat-label">Next Scan</span>
             <span className="stat-value">{state.next_scan_secs}s</span>
           </div>
+          {/* Quick Actions */}
+          <div className="stat-card" style={{ display: 'flex', gap: '6px', alignItems: 'center', justifyContent: 'center', padding: '8px' }}>
+            <QuickActionButton label="Freeze" color="#f87171" onClick={() => fetch('/ai/freeze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ duration_secs: 3600 }) })} />
+            <QuickActionButton label="Unfreeze" color="#4ade80" onClick={() => fetch('/ai/unfreeze', { method: 'POST', headers: { 'Content-Type': 'application/json' } })} />
+            <QuickActionButton label="Close All" color="#dc2626" onClick={() => fetch('/ai/close', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })} />
+            <a href="/api/csv/export" download style={{ textDecoration: 'none' }}>
+              <QuickActionButton label="CSV" color="#60a5fa" onClick={() => {}} />
+            </a>
+          </div>
         </div>
       </header>
 
@@ -142,6 +172,12 @@ function App() {
           todayPnl={state.today_pnl || '0'}
           isFrozen={state.is_frozen || false}
           freezeUntilSecs={state.freeze_until_secs}
+          walletBlacklist={state.wallet_blacklist || []}
+          pnlHistory={state.pnl_history || []}
+          perf={state.perf || { started_at_secs: 0, today_api_calls: 0, last_api_latency_ms: 0, avg_api_latency_ms: 0, last_copy_latency_ms: 0, avg_copy_latency_ms: 0 }}
+          todayRealizedLoss={state.today_realized_loss || '0'}
+          dailyStartBalance={state.daily_start_balance || '0'}
+          dailyLossTriggered={state.daily_loss_triggered || false}
         />
       ) : activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>

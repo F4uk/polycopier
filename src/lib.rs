@@ -15,6 +15,7 @@ pub mod slippage_guard;
 pub mod state;
 pub mod stop_loss;
 pub mod strategy;
+pub mod telegram;
 pub mod ui;
 pub mod utils;
 pub mod wallet_sync;

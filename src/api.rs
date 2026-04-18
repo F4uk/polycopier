@@ -13,7 +13,7 @@
 
 use crate::config::BotConfig;
 use crate::models::{EvaluatedTrade, Position, TargetPosition};
-use crate::state::{BotState, WalletStats};
+use crate::state::{BotState, PerfMetrics, PnlSnapshot, WalletStats};
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
@@ -137,6 +137,20 @@ pub struct StateResponse {
     pub is_frozen: bool,
     /// Unix timestamp (seconds) when freeze expires. Null if not frozen.
     pub freeze_until_secs: Option<u64>,
+    /// Today's realized loss (for daily loss circuit-breaker).
+    pub today_realized_loss: Decimal,
+    /// Daily starting balance (for daily loss %).
+    pub daily_start_balance: Decimal,
+    /// Whether daily loss circuit-breaker was triggered.
+    pub daily_loss_triggered: bool,
+    /// Currently blacklisted wallet addresses.
+    pub wallet_blacklist: Vec<String>,
+    /// Performance metrics.
+    pub perf: PerfMetrics,
+    /// PnL history snapshots for equity curve.
+    pub pnl_history: Vec<PnlSnapshot>,
+    /// Whether running in simulation mode.
+    pub is_sim: bool,
 }
 
 async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
@@ -197,6 +211,13 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
                 .map(|st| st.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
                 .unwrap_or(0)
         }),
+        today_realized_loss: guard.today_realized_loss,
+        daily_start_balance: guard.daily_start_balance,
+        daily_loss_triggered: guard.daily_loss_triggered,
+        wallet_blacklist: guard.wallet_blacklist.iter().cloned().collect(),
+        perf: guard.perf.clone(),
+        pnl_history: guard.pnl_history.clone(),
+        is_sim: false, // will be overridden by caller if needed
     })
 }
 
@@ -484,8 +505,143 @@ async fn ai_freeze(
 }
 
 // ---------------------------------------------------------------------------
-// Config / Env handlers
+// AI unfreeze endpoint
 // ---------------------------------------------------------------------------
+
+async fn ai_unfreeze(State(api_state): State<ApiState>) -> impl IntoResponse {
+    info!("[AI/unfreeze] called — clearing freeze");
+    {
+        let mut guard = api_state.bot_state.write().await;
+        guard.freeze_until = None;
+    }
+    (
+        axum::http::StatusCode::OK,
+        Json(AiActionResponse {
+            success: true,
+            message: "Trading unfrozen. New BUY entries are allowed.".to_string(),
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Performance metrics endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct PerfResponse {
+    pub perf: PerfMetrics,
+    pub uptime_secs: u64,
+}
+
+async fn get_perf(State(api_state): State<ApiState>) -> Json<PerfResponse> {
+    let guard = api_state.bot_state.read().await;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let uptime = now_secs.saturating_sub(guard.perf.started_at_secs);
+    Json(PerfResponse {
+        perf: guard.perf.clone(),
+        uptime_secs: uptime,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Wallet blacklist management
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct WalletBlacklistRequest {
+    pub wallet: String,
+}
+
+#[derive(Serialize)]
+pub struct WalletBlacklistResponse {
+    pub wallet: String,
+    pub blacklisted: bool,
+}
+
+async fn post_wallet_blacklist(
+    State(api_state): State<ApiState>,
+    Json(req): Json<WalletBlacklistRequest>,
+) -> Json<WalletBlacklistResponse> {
+    let key = req.wallet.to_lowercase();
+    let mut guard = api_state.bot_state.write().await;
+    let was_in = guard.wallet_blacklist.contains(&key);
+    if was_in {
+        guard.wallet_blacklist.remove(&key);
+    } else {
+        guard.wallet_blacklist.insert(key.clone());
+    }
+    info!(
+        "[API] Wallet blacklist toggled for {}: {}",
+        &key[..key.len().min(10)],
+        !was_in
+    );
+    Json(WalletBlacklistResponse {
+        wallet: req.wallet,
+        blacklisted: !was_in,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CSV export endpoint
+// ---------------------------------------------------------------------------
+
+async fn get_csv_export(State(api_state): State<ApiState>) -> impl IntoResponse {
+    let guard = api_state.bot_state.read().await;
+    let ledger = api_state.copy_ledger.lock().await;
+
+    let mut csv = String::from("token_id,source_wallet,size,entry_price,copied_at,closed\n");
+    for entry in &ledger.entries {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            entry.token_id,
+            entry.source_wallet,
+            entry.size,
+            entry.entry_price,
+            entry.copied_at,
+            if entry.closed { "CLOSED" } else { "OPEN" }
+        ));
+    }
+
+    // Also add wallet stats
+    csv.push_str(
+        "\n\nWallet Stats\nwallet,total_copies,wins,losses,win_rate,total_pnl,blacklisted\n",
+    );
+    for (wallet, stats) in &guard.wallet_stats {
+        let wr = if stats.wins + stats.losses > 0 {
+            stats.wins as f64 / (stats.wins + stats.losses) as f64 * 100.0
+        } else {
+            0.0
+        };
+        let bl = guard.wallet_blacklist.contains(wallet);
+        csv.push_str(&format!(
+            "{},{},{},{},{:.1}%,{},{}\n",
+            wallet, stats.total_copies, stats.wins, stats.losses, wr, stats.total_pnl, bl
+        ));
+    }
+
+    (
+        [
+            ("content-type", "text/csv"),
+            (
+                "content-disposition",
+                "attachment; filename=polycopier_export.csv",
+            ),
+        ],
+        csv,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// PnL history endpoint
+// ---------------------------------------------------------------------------
+
+async fn get_pnl_history(State(api_state): State<ApiState>) -> Json<Vec<PnlSnapshot>> {
+    let guard = api_state.bot_state.read().await;
+    Json(guard.pnl_history.clone())
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct EnvData {
@@ -598,6 +754,14 @@ pub fn create_router(
         // AI emergency control
         .route("/ai/close", post(ai_close))
         .route("/ai/freeze", post(ai_freeze))
+        .route("/ai/unfreeze", post(ai_unfreeze))
+        // Performance & monitoring
+        .route("/api/perf", get(get_perf))
+        .route("/api/pnl/history", get(get_pnl_history))
+        // Wallet blacklist
+        .route("/api/wallet/blacklist", post(post_wallet_blacklist))
+        // CSV export
+        .route("/api/csv/export", get(get_csv_export))
         .with_state(state)
         .layer(cors)
         .fallback_service(serve_dir)
