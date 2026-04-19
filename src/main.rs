@@ -366,12 +366,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── Stop-loss / take-profit monitor ──────────────────────────────────────
-    stop_loss::start_stop_loss_monitor(
+    tokio::spawn(stop_loss::start_stop_loss_monitor(
         state.clone(),
         sl_state.clone(),
         submitter_for_stop_loss,
         config.clone(),
-    );
+    ));
 
     // ── PnL sampler + Telegram notifier + circuit-breaker ──────────────────
     telegram::start_pnl_sampler(state.clone(), config.clone());

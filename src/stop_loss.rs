@@ -289,7 +289,7 @@ fn format_pct(v: Decimal) -> String {
 // ---------------------------------------------------------------------------
 
 /// Start the dynamic tiered stop-loss / trailing take-profit monitor.
-pub fn start_stop_loss_monitor(
+pub async fn start_stop_loss_monitor(
     state: Arc<RwLock<BotState>>,
     sl_state: Arc<Mutex<StopLossState>>,
     submitter: OrderSubmitter,
@@ -297,43 +297,42 @@ pub fn start_stop_loss_monitor(
 ) {
     // Do not start if disabled
     {
-        let guard = sl_state.blocking_lock();
+        let guard = sl_state.lock().await;
         if !guard.enabled {
             info!("[SL/TP] Disabled in config — monitor not started.");
             return;
         }
     }
 
-    tokio::spawn(async move {
-        let (check_interval, force_stop, force_close) = {
+    let (check_interval, force_stop, force_close) = {
+        let guard = sl_state.lock().await;
+        (
+            tokio::time::Duration::from_secs(guard.check_interval_secs.max(1)),
+            guard.force_stop_price,
+            guard.force_close_price,
+        )
+    };
+
+    info!(
+        "[SL/TP] Monitor started (checking every {}s, force_stop={:.2}, force_close={:.2}).",
+        check_interval.as_secs(),
+        force_stop,
+        force_close
+    );
+
+    let mut interval = tokio::time::interval(check_interval);
+
+    loop {
+        interval.tick().await;
+
+        // Snapshot tracked positions
+        let tracked: Vec<TrackedPosition> = {
             let guard = sl_state.lock().await;
-            (
-                tokio::time::Duration::from_secs(guard.check_interval_secs.max(1)),
-                guard.force_stop_price,
-                guard.force_close_price,
-            )
+            if !guard.enabled {
+                continue;
+            }
+            guard.positions.values().cloned().collect()
         };
-
-        info!(
-            "[SL/TP] Monitor started (checking every {}s, force_stop={:.2}, force_close={:.2}).",
-            check_interval.as_secs(),
-            force_stop,
-            force_close
-        );
-
-        let mut interval = tokio::time::interval(check_interval);
-
-        loop {
-            interval.tick().await;
-
-            // Snapshot tracked positions
-            let tracked: Vec<TrackedPosition> = {
-                let guard = sl_state.lock().await;
-                if !guard.enabled {
-                    continue;
-                }
-                guard.positions.values().cloned().collect()
-            };
 
             // Get current prices + end dates from BotState
             // cur_price comes from Polymarket official API via wallet_sync
@@ -619,7 +618,7 @@ pub fn start_stop_loss_monitor(
                     .retain(|token_id, _| bot.positions.contains_key(token_id));
             }
         }
-    });
+    }
 }
 
 // ---------------------------------------------------------------------------
