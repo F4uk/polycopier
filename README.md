@@ -176,8 +176,8 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
   and each target wallet directly via the API every 30 seconds and computes the
   intersection. Never based on session state or scanner timing.
 
-- **Pre-commit quality gates** — `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
-  run automatically before every commit via `.githooks/pre-commit`.
+- **CI quality gates** — `cargo fmt`, `cargo clippy -D warnings`, and `cargo test`
+  run automatically on every PR via GitHub Actions.
 
 - **AI Risk Control API** — an embedded HTTP server listens on `127.0.0.1:8989` and
   exposes two endpoints for external AI agents or scripts to control the bot:
@@ -204,6 +204,17 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
   same address executes ≥ **3 trades on the same token within 60 seconds**. Such patterns
   are a common signal of artificial volume used to attract Polymarket's copy-trading
   signal. Detected trades are logged and skipped; the address remains monitored.
+
+- **Per-Category Position Limits** — limits total open position size per market category
+  (e.g. `politics.us-election`, `sports.nfl`). Enforced at BUY entry time. Categories
+  not in the list fall back to a configurable default. Setting a category's limit to `0`
+  fully blocks entries in that category. Presets available: Conservative, Aggressive,
+  Politics-only. Configure via the `[risk_by_category]` section in `config.toml` or the
+  Settings panel in the Web UI.
+
+- **PnL & Equity Chart** — 7-day real-time equity and realized+unrealized PnL history
+  stored at 10-second intervals (up to 60,480 snapshots). Exposed via `GET /api/pnl_history`
+  and rendered as an interactive SVG chart in the Web UI's PnL tab. Time ranges: 1H / 1D / 7D.
 
 - **Local Stop-Loss & Take-Profit** — a background task monitors all open positions
   against configurable thresholds (disabled by default):
@@ -232,8 +243,6 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
 ```bash
 git clone https://github.com/cbaezp/polycopier
 cd polycopier
-# Enable the pre-commit quality gate
-git config core.hooksPath .githooks
 cargo build --release
 ```
 
@@ -326,6 +335,14 @@ On first run, if `config.toml` is missing the bot auto-generates it from default
 | `stop_loss_pct` | `0.15` | Exit if price falls below `entry × (1 − stop_loss_pct)` (15% = `0.15`) |
 | `take_profit_pct` | `0.30` | Exit if price rises above `entry × (1 + take_profit_pct)` (30% = `0.30`) |
 | `check_interval_secs` | `3` | Seconds between background checks of all open positions |
+
+#### `[risk_by_category]`
+
+| Key | Default | Description |
+:|---|---|---|
+| `enabled` | `false` | Enable per-category position size limits |
+| `limits` | `{}` | HashMap of `category → max_usd_position` (e.g. `{"politics.us-election": 200}`) |
+| `default_limit` | `0` | Fallback limit for uncategorized markets. `0` = no default cap |
 
 #### AI Risk Control API
 

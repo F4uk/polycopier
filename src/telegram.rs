@@ -48,13 +48,7 @@ impl TelegramNotifier {
             "parse_mode": "HTML"
         });
 
-        match self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-        {
+        match self.client.post(&url).json(&body).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     debug!("[Telegram] Message sent successfully");

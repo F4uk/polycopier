@@ -20,9 +20,9 @@ pub mod utils;
 pub mod wallet_sync;
 pub mod wash_trade_filter;
 
+use anyhow::Context;
 use std::collections::HashSet;
 use std::sync::Arc;
-use anyhow::Context;
 use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::prelude::*;
 
@@ -93,7 +93,11 @@ fn build_ui() -> anyhow::Result<bool> {
         .context("Failed to run npm install")?;
     if !install_out.status.success() {
         let stderr = String::from_utf8_lossy(&install_out.stderr);
-        anyhow::bail!("npm install failed (exit {}):\n{}", install_out.status, stderr);
+        anyhow::bail!(
+            "npm install failed (exit {}):\n{}",
+            install_out.status,
+            stderr
+        );
     }
 
     tracing::info!("Building Web UI...");
@@ -105,7 +109,11 @@ fn build_ui() -> anyhow::Result<bool> {
         .context("Failed to run npm run build")?;
     if !build_out.status.success() {
         let stderr = String::from_utf8_lossy(&build_out.stderr);
-        anyhow::bail!("npm run build failed (exit {}):\n{}", build_out.status, stderr);
+        anyhow::bail!(
+            "npm run build failed (exit {}):\n{}",
+            build_out.status,
+            stderr
+        );
     }
 
     tracing::info!("Web UI successfully built.");
@@ -318,7 +326,12 @@ async fn main() -> anyhow::Result<()> {
     // Position-close sweep — backstop that emits synthetic SELLs for any
     // position we hold that no target still holds (catches missed WS SELL events).
     // Gap 2 fix: pass copy_ledger so sweep uses the correct source_wallet.
-    wallet_sync::start_position_close_sweep(config.clone(), state.clone(), event_tx, copy_ledger.clone());
+    wallet_sync::start_position_close_sweep(
+        config.clone(),
+        state.clone(),
+        event_tx,
+        copy_ledger.clone(),
+    );
 
     // Copied counter (header "Copied: N" — live API intersection every 30 s)
     copied_counter::start_copied_counter(

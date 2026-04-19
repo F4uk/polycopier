@@ -23,6 +23,7 @@ use axum::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -692,9 +693,9 @@ async fn get_sl_status(
 // PnL history endpoint
 // ---------------------------------------------------------------------------
 
-async fn get_pnl_history(State(api_state): State<ApiState>) -> Json<Vec<PnlSnapshot>> {
+async fn get_pnl_history(State(api_state): State<ApiState>) -> Json<Vec<Value>> {
     let guard = api_state.bot_state.read().await;
-    Json(guard.pnl_history.clone())
+    Json(guard.get_pnl_history_for_chart())
 }
 
 #[derive(Serialize, Deserialize)]

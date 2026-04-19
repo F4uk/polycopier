@@ -349,6 +349,7 @@ async fn scan_positions(
                 size: pos.size,
                 status,
                 source_wallet: wallet_str.to_string(),
+                category: String::new(),
             });
         }
     }

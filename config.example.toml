@@ -80,3 +80,16 @@ enable_partial_close = true
 local_cache_ttl_secs = 3
 # API timeout threshold in seconds for smart degradation (fallback to local ledger decisions)
 api_timeout_degrade_secs = 3
+
+[risk_by_category]
+# Enable per-category position limits. When enabled, each market category
+# (e.g. "politics.us-election", "economics.fed") has its own max position cap.
+enabled = false
+# Default max position per category (USDC). Unlisted categories use this.
+# Set to 0 to completely disable a category.
+default_limit = 20.0
+# Example per-category limits (uncomment to use):
+# "politics.us-election" = 20.0
+# "politics.congress" = 15.0
+# "economics.fed" = 10.0
+# "sports.tennis" = 0.0  # 0 = fully disabled

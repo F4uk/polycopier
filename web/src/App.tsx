@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import SettingsManager from './SettingsManager';
 import SetupWizard from './SetupWizard';
 import AiPanel from './AiPanel';
+import PnLChart from './PnLChart';
 
 function QuickActionButton({ label, color, onClick }: { label: string; color: string; onClick: () => void }) {
   return (
@@ -26,7 +27,7 @@ function QuickActionButton({ label, color, onClick }: { label: string; color: st
 
 function App() {
   const [state, setState] = useState<any>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'settings' | 'ai'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'settings' | 'ai' | 'pnl'>('dashboard');
   const [setupRequired, setSetupRequired] = useState(false);
 
   useEffect(() => {
@@ -125,6 +126,7 @@ function App() {
           <div className="nav-tabs">
             <button className={`nav-tab ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>Dashboard</button>
             <button className={`nav-tab ${activeTab === 'ai' ? 'active' : ''}`} onClick={() => setActiveTab('ai')}>AI Stats</button>
+            <button className={`nav-tab ${activeTab === 'pnl' ? 'active' : ''}`} onClick={() => setActiveTab('pnl')}>PnL Chart</button>
             <button className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>Settings & Env</button>
           </div>
         </div>
@@ -380,6 +382,40 @@ function App() {
           </div>
         </div>
       </div>
+      ) : activeTab === 'pnl' ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          <div className="glass-panel">
+            <div className="panel-header">Equity &amp; PnL Over Time</div>
+            <div style={{ padding: '0.5rem 0.25rem' }}>
+              <PnLChart />
+            </div>
+          </div>
+          {/* Quick stats row */}
+          <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+            <div className="stat-card">
+              <span className="stat-label">Current Equity</span>
+              <span className="stat-value">${parseFloat(state.total_balance).toFixed(2)}</span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-label">Total Unrealized</span>
+              <span className={`stat-value ${parseFloat(state.unrealized_pnl) >= 0 ? 'val-positive' : 'val-negative'}`}>
+                ${parseFloat(state.unrealized_pnl).toFixed(2)}
+              </span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-label">Today PnL</span>
+              <span className={`stat-value ${parseFloat(state.today_pnl) >= 0 ? 'val-positive' : 'val-negative'}`}>
+                ${parseFloat(state.today_pnl).toFixed(2)}
+              </span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-label">Daily Realized Loss</span>
+              <span className="stat-value val-negative">
+                ${parseFloat(state.today_realized_loss || '0').toFixed(2)}
+              </span>
+            </div>
+          </div>
+        </div>
       ) : activeTab === 'settings' ? (
         <SettingsManager />
       ) : null}

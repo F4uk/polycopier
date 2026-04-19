@@ -10,6 +10,9 @@
 # Commit config.example.toml instead; each environment manages its own config.toml
 config.toml
 
+# Frontend build output
+web/dist/
+
 # Runtime logs and data
 *.log
 bot.log
@@ -27,7 +30,4 @@ sim_copy_ledger.json
 .DS_Store
 
 # Rust
-Cargo.lock
 .agents/
-
-src/bin/order_test.rs

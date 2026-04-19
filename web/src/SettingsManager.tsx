@@ -20,8 +20,18 @@ export default function SettingsManager() {
     setMessage("");
 
     try {
+      // Build config payload, converting category limits to numeric values
+      const payloadConfig: any = { ...config };
+      // Ensure risk_by_category fields exist
+      payloadConfig.risk_by_category_enabled = payloadConfig.risk_by_category_enabled ?? false;
+      payloadConfig.risk_by_category_default = parseFloat(payloadConfig.risk_by_category_default ?? 0);
+      // Convert limit values to numbers
+      const numericLimits: Record<string, number> = {};
+      for (const [k, v] of Object.entries(payloadConfig.risk_by_category_limits ?? {})) {
+        numericLimits[k] = parseFloat(String(v)) || 0;
+      }
+      payloadConfig.risk_by_category_limits = numericLimits;
       // Clean up target wallets array if string
-      const payloadConfig = { ...config };
       if (typeof payloadConfig.targets?.wallets === "string") {
         payloadConfig.targets.wallets = payloadConfig.targets.wallets
           .split(",")
@@ -86,6 +96,131 @@ export default function SettingsManager() {
             onChange={(e) => setEnvData({ ...envData, funder_address: e.target.value })}
             placeholder="0x..."
           />
+        </div>
+      </div>
+
+      <div className="glass-panel">
+        <div className="panel-header">Per-Category Position Limits</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={config.risk_by_category_enabled ?? false}
+              onChange={(e) => setConfig({ ...config, risk_by_category_enabled: e.target.checked })}
+              style={{ width: 'auto', margin: 0 }}
+            />
+            <span style={{ fontWeight: 600 }}>Enable Category Limits</span>
+          </label>
+          <span className="field-hint" style={{ marginBottom: 0 }}>
+            Limit total position size per market category (e.g. politics, sports, finance)
+          </span>
+        </div>
+
+        {/* Presets */}
+        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', alignItems: 'center' }}>
+          <span className="field-hint" style={{ marginBottom: 0, marginRight: '0.25rem' }}>Presets:</span>
+          {[
+            { label: 'Conservative', limits: { 'politics.us-election': 100, 'sports.nfl': 50, 'politics.general': 50, 'default': 30 } },
+            { label: 'Aggressive', limits: { 'politics.us-election': 500, 'sports.nfl': 300, 'default': 200 } },
+            { label: 'Politics Only', limits: { 'politics': 200, 'default': 100 } },
+          ].map((preset) => (
+            <button
+              key={preset.label}
+              className="btn btn-secondary"
+              style={{ padding: '3px 10px', fontSize: '0.75rem' }}
+              onClick={() => {
+                setConfig({
+                  ...config,
+                  risk_by_category_enabled: true,
+                  risk_by_category_limits: preset.limits,
+                  risk_by_category_default: preset.limits['default'] ?? 100,
+                });
+              }}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Category limits list */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '0.75rem' }}>
+          {Object.entries(config.risk_by_category_limits ?? {}).map(([cat, limit]: [string, any], idx: number) => (
+            <div key={idx} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <input
+                type="text"
+                value={cat}
+                onChange={(e) => {
+                  const newLimits = { ...config.risk_by_category_limits };
+                  delete newLimits[cat];
+                  newLimits[e.target.value] = limit;
+                  setConfig({ ...config, risk_by_category_limits: newLimits });
+                }}
+                placeholder="e.g. politics.us-election"
+                style={{ flex: 1 }}
+              />
+              <span style={{ color: 'var(--text-secondary)' }}>$</span>
+              <input
+                type="number"
+                min="0"
+                step="10"
+                value={parseFloat(limit) || 0}
+                onChange={(e) => {
+                  const newLimits = { ...config.risk_by_category_limits };
+                  newLimits[cat] = e.target.value;
+                  setConfig({ ...config, risk_by_category_limits: newLimits });
+                }}
+                style={{ width: '100px' }}
+              />
+              <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>USD max</span>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  const newLimits = { ...config.risk_by_category_limits };
+                  delete newLimits[cat];
+                  setConfig({ ...config, risk_by_category_limits: newLimits });
+                }}
+                style={{ padding: '2px 8px', color: '#f87171', borderColor: '#f8717166' }}
+              >
+                X
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <button
+          className="btn btn-secondary"
+          style={{ marginBottom: '0.75rem', fontSize: '0.8rem' }}
+          onClick={() => {
+            const newLimits = { ...(config.risk_by_category_limits ?? {}) };
+            newLimits[''] = config.risk_by_category_default ?? 100;
+            setConfig({ ...config, risk_by_category_limits: newLimits });
+          }}
+        >
+          + Add Category
+        </button>
+
+        {/* Default limit */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border-color)' }}>
+          <span className="field-hint" style={{ marginBottom: 0, minWidth: '180px' }}>
+            Default limit (uncategorized):
+          </span>
+          <span style={{ color: 'var(--text-secondary)' }}>$</span>
+          <input
+            type="number"
+            min="0"
+            step="10"
+            value={parseFloat(config.risk_by_category_default ?? 0) || 0}
+            onChange={(e) => setConfig({ ...config, risk_by_category_default: e.target.value })}
+            style={{ width: '100px' }}
+          />
+          <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>USD</span>
+        </div>
+
+        <div style={{ marginTop: '0.5rem' }}>
+          <span className="field-hint">
+            <strong>Tip:</strong> Categories are derived from market slugs (e.g. "US 2024 Election" → "politics.us-election").
+            Set limit to <strong>0</strong> to fully block a category. Categories not in the list fall back to the default.
+          </span>
         </div>
       </div>
 

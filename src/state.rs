@@ -2,6 +2,7 @@ use crate::models::{ActiveApiOrder, EvaluatedTrade, Position, QueuedOrder, Targe
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::str::FromStr;
 use std::time::Instant;
 
 /// Per-wallet win/loss statistics for the AI stats panel.
@@ -324,10 +325,30 @@ impl BotState {
             unrealized_pnl: self.unrealized_pnl,
             total_balance: self.total_balance,
         });
-        // Keep last 1440 snapshots (24h at 60s intervals)
-        if self.pnl_history.len() > 1440 {
+        // Keep last 60480 snapshots (7 days at 10s intervals) — enough for chart display
+        if self.pnl_history.len() > 60480 {
             self.pnl_history.remove(0);
         }
+    }
+
+    /// Returns the equity curve data formatted for frontend chart consumption.
+    /// Each entry: { timestamp: "2026-04-19T12:00:00Z", equity: 1050.50, pnl: 50.50 }
+    pub fn get_pnl_history_for_chart(&self) -> Vec<serde_json::Value> {
+        self.pnl_history
+            .iter()
+            .map(|s| {
+                let ts = chrono::DateTime::from_timestamp(s.timestamp_secs as i64, 0)
+                    .unwrap_or_else(chrono::Utc::now);
+                let equity = rust_decimal::Decimal::from_str(&format!("{:.2}", s.total_balance))
+                    .unwrap_or(s.total_balance);
+                let pnl = s.realized_pnl + s.unrealized_pnl;
+                serde_json::json!({
+                    "timestamp": ts.to_rfc3339(),
+                    "equity": f64::try_from(equity).unwrap_or(0.0),
+                    "pnl": f64::try_from(pnl).unwrap_or(0.0),
+                })
+            })
+            .collect()
     }
 
     fn maybe_reset_today(&mut self) {

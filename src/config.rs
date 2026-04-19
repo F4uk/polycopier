@@ -48,6 +48,7 @@ pub struct BotConfig {
     pub market_filter: MarketFilterConfig,
     pub telegram: TelegramConfig,
     pub trading: TradingConfig,
+    pub risk_by_category: RiskByCategoryConfig,
 }
 
 /// Copy-trade target wallets — public on-chain addresses, safe in config.toml.
@@ -162,6 +163,21 @@ pub struct TelegramConfig {
     pub min_pnl_usd: Decimal,
 }
 
+/// Per-category position limit config.
+/// Stored as: HashMap<category_name, max_position_usd>
+/// Category names match Polymarket API (e.g. "politics.us-election").
+/// 0.0 = completely disabled (no entries allowed).
+/// Missing categories fall back to the default_limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskByCategoryConfig {
+    /// Enable per-category position limits.
+    pub enabled: bool,
+    /// Per-category max position sizes (USDC). HashMap key = category slug.
+    pub limits: std::collections::HashMap<String, Decimal>,
+    /// Default max position size for categories not in `limits`.
+    pub default_limit: Decimal,
+}
+
 /// Trading strategy config: token ownership, partial close, and API latency tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradingConfig {
@@ -244,6 +260,11 @@ impl Default for BotConfig {
                 local_cache_ttl_secs: 3,
                 api_timeout_degrade_secs: 3,
             },
+            risk_by_category: RiskByCategoryConfig {
+                enabled: false,
+                limits: std::collections::HashMap::new(),
+                default_limit: Decimal::from(20),
+            },
         }
     }
 }
@@ -307,6 +328,10 @@ pub struct Config {
     pub enable_partial_close: bool,
     pub local_cache_ttl_secs: u64,
     pub api_timeout_degrade_secs: u64,
+    // Risk by category
+    pub risk_by_category_enabled: bool,
+    pub risk_by_category_limits: std::collections::HashMap<String, Decimal>,
+    pub risk_by_category_default: Decimal,
     pub is_sim: bool,
     pub sim_balance: Option<rust_decimal::Decimal>,
 }
@@ -474,7 +499,20 @@ enable_partial_close = {epc}
 # Local state cache TTL in seconds for our and target wallet positions
 local_cache_ttl_secs = {cache_ttl}
 # API timeout threshold in seconds for smart degradation (fallback to local ledger)
-api_timeout_degrade_secs = {api_degrade}"#,
+api_timeout_degrade_secs = {api_degrade}
+
+[risk_by_category]
+# Enable per-category position limits. When enabled, each market category
+# (e.g. "politics.us-election", "economics.fed") has its own max position cap.
+enabled = {rbc_enabled}
+# Default max position per category (USDC). Unlisted categories use this.
+# Set to 0 to completely disable a category.
+default_limit = {rbc_default}
+# Example per-category limits (uncomment to use):
+# "politics.us-election" = 20.0
+# "politics.congress" = 15.0
+# "economics.fed" = 10.0
+# "sports.tennis" = 0.0  # 0 = fully disabled"#,
         wallets = wallets_toml,
         slippage = cfg.execution.max_slippage_pct,
         max_trade = cfg.execution.max_trade_size_usd,
@@ -518,6 +556,8 @@ api_timeout_degrade_secs = {api_degrade}"#,
         epc = cfg.trading.enable_partial_close,
         cache_ttl = cfg.trading.local_cache_ttl_secs,
         api_degrade = cfg.trading.api_timeout_degrade_secs,
+        rbc_enabled = cfg.risk_by_category.enabled,
+        rbc_default = cfg.risk_by_category.default_limit,
     );
     fs::write(CONFIG_TOML_PATH, content)?;
     Ok(())
@@ -701,6 +741,11 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
                 "API_TIMEOUT_DEGRADE_SECS",
                 defaults.trading.api_timeout_degrade_secs,
             ),
+        },
+        risk_by_category: RiskByCategoryConfig {
+            enabled: defaults.risk_by_category.enabled,
+            limits: defaults.risk_by_category.limits.clone(),
+            default_limit: defaults.risk_by_category.default_limit,
         },
     }
 }
@@ -934,6 +979,9 @@ impl Config {
             enable_partial_close: cfg.trading.enable_partial_close,
             local_cache_ttl_secs: cfg.trading.local_cache_ttl_secs,
             api_timeout_degrade_secs: cfg.trading.api_timeout_degrade_secs,
+            risk_by_category_enabled: cfg.risk_by_category.enabled,
+            risk_by_category_limits: cfg.risk_by_category.limits.clone(),
+            risk_by_category_default: cfg.risk_by_category.default_limit,
             is_sim: false, // Injected dynamically in Config::load_or_prompt wrapper
             sim_balance: None,
         }

@@ -150,6 +150,8 @@ pub struct TargetPosition {
     pub status: ScanStatus,
     /// The target wallet address this position was fetched from.
     pub source_wallet: String,
+    /// Market category, e.g. "politics.us-election". Empty if unknown.
+    pub category: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

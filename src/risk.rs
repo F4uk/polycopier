@@ -8,9 +8,11 @@
 //! | Daily volume limit | `MAX_DAILY_VOLUME_USD` | 0 (disabled) | 12 |
 //! | Consecutive-loss circuit breaker | `MAX_CONSECUTIVE_LOSSES` | 0 (disabled) | 12 |
 //! | Rapid-flip guard | — | 60s cooldown per token | 12 |
+//! | Per-category position limit | `[risk_by_category]` | 0 (disabled) | new |
 
 use crate::config::Config;
 use crate::models::{TradeEvent, TradeSide};
+use crate::state::BotState;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -151,5 +153,106 @@ impl RiskEngine {
                 self.config.loss_cooldown_secs
             );
         }
+    }
+
+    /// Compute total position size (in USDC) for a given category.
+    /// Sums up: for each position in state.positions,
+    /// find its TargetPosition (via token_id) and check if it belongs to the given category.
+    /// Position size * cur_price = USDC value.
+    fn get_category_position_size(&self, state: &BotState, category: &str) -> Decimal {
+        let mut total = Decimal::ZERO;
+        for (token_id, position) in &state.positions {
+            if let Some(target_pos) = state
+                .target_positions
+                .iter()
+                .find(|tp| &tp.token_id == token_id)
+            {
+                if target_pos.category == category {
+                    let size_usd = position.size * target_pos.cur_price;
+                    total += size_usd;
+                }
+            }
+        }
+        total
+    }
+
+    /// Check if a trade is allowed under category position limits.
+    /// Returns Ok(()) if allowed, or Err(message) if blocked.
+    /// Only applies to BUY (entry) trades.
+    pub fn check_category_limit(
+        &self,
+        _token_id: &str,
+        category: &str,
+        trade_value_usd: Decimal,
+        state: &BotState,
+    ) -> Result<(), String> {
+        if !self.config.risk_by_category_enabled {
+            return Ok(());
+        }
+        // If no explicit limits configured, skip
+        if self.config.risk_by_category_limits.is_empty() {
+            return Ok(());
+        }
+
+        let limit = self
+            .config
+            .risk_by_category_limits
+            .get(category)
+            .copied()
+            .unwrap_or(self.config.risk_by_category_default);
+
+        if limit == Decimal::ZERO {
+            return Err(format!(
+                "Category '{}' is completely disabled (position limit = 0)",
+                category
+            ));
+        }
+
+        let current_size = self.get_category_position_size(state, category);
+        let new_size = current_size + trade_value_usd;
+
+        if new_size > limit {
+            tracing::warn!(
+                "[Risk/Category] Skipping open: category '{}' would exceed position limit \
+                 (current ${:.2} + trade ${:.2} > limit ${:.2})",
+                category,
+                current_size,
+                trade_value_usd,
+                limit
+            );
+            return Err(format!(
+                "Category '{}' position limit would be exceeded: current ${:.2} + trade ${:.2} > limit ${:.2}",
+                category,
+                current_size,
+                trade_value_usd,
+                limit
+            ));
+        }
+
+        tracing::info!(
+            "[Risk/Category] Category '{}': current=${:.2}, trade=${:.2}, limit=${:.2}",
+            category,
+            current_size,
+            trade_value_usd,
+            limit
+        );
+
+        Ok(())
+    }
+
+    /// Extended trade check that includes category limit validation.
+    /// Call this from the strategy engine for BUY entries where category is known.
+    pub fn check_trade_with_category(
+        &mut self,
+        trade: &TradeEvent,
+        category: &str,
+        state: &BotState,
+    ) -> Result<(), String> {
+        self.check_trade(trade)?; // existing checks first
+        if trade.side == TradeSide::BUY {
+            let trade_value = trade.size * trade.price;
+            self.check_category_limit(&trade.token_id, category, trade_value, state)?;
+        }
+        Ok(())
     }
 }

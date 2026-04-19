@@ -612,6 +612,38 @@ pub fn start_strategy_engine(
                 }
             }
 
+            // 9. Per-category position limit (risk_by_category config)
+            // Check if entering this category would exceed the configured max position.
+            if eval.validated && event.side == TradeSide::BUY {
+                let category = {
+                    let guard = state.read().await;
+                    guard
+                        .target_positions
+                        .iter()
+                        .find(|p| p.token_id == event.token_id)
+                        .map(|p| p.category.clone())
+                        .unwrap_or_default()
+                };
+                if !category.is_empty() {
+                    // Need to drop the guard before calling risk_engine which may also need state
+                    // so we duplicate the read scope
+                    let guard2 = state.read().await;
+                    let reason = risk_engine
+                        .check_category_limit(
+                            &event.token_id,
+                            &category,
+                            event.size * event.price,
+                            &guard2,
+                        )
+                        .err();
+                    drop(guard2);
+                    if let Some(msg) = reason {
+                        eval.validated = false;
+                        eval.reason = Some(msg);
+                    }
+                }
+            }
+
             // -- Intent classification: live API + copy ledger ------------------
             //
             // Rules:
@@ -852,10 +884,12 @@ pub fn start_strategy_engine(
                                         let ledger = copy_ledger.lock().await;
                                         // Only add a new ledger entry if this wallet doesn't
                                         // already have one for this token.
-                                        let already_from_this_wallet = ledger.entries.iter().any(|e| {
-                                            !e.closed && e.token_id == event.token_id
-                                                && e.source_wallet == event.taker_address
-                                        });
+                                        let already_from_this_wallet =
+                                            ledger.entries.iter().any(|e| {
+                                                !e.closed
+                                                    && e.token_id == event.token_id
+                                                    && e.source_wallet == event.taker_address
+                                            });
                                         if !already_from_this_wallet {
                                             info!(
                                                 "[Ownership] Multi-wallet: token {} also held by {} (multi_wallet_average) — recording additional source",
@@ -995,19 +1029,22 @@ pub fn start_strategy_engine(
                                                                 // BUG-1 FIX: use partial_limit_price (our actual
                                                                 // execution price) instead of event.price (target's
                                                                 // reported price) for accurate PnL.
-                                                                let partial_pnl = (partial_limit_price
-                                                                    - partial_entry_price)
-                                                                    * our_reduction;
+                                                                let partial_pnl =
+                                                                    (partial_limit_price
+                                                                        - partial_entry_price)
+                                                                        * our_reduction;
                                                                 let mut guard =
                                                                     partial_state.write().await;
                                                                 guard.realized_pnl += partial_pnl;
                                                                 // BUG-2 FIX: update position size in state so
                                                                 // subsequent partial/full closes use the correct
                                                                 // remaining size instead of the original full size.
-                                                                if let Some(pos) =
-                                                                    guard.positions.get_mut(&partial_token_id)
+                                                                if let Some(pos) = guard
+                                                                    .positions
+                                                                    .get_mut(&partial_token_id)
                                                                 {
-                                                                    pos.size = our_held_size - our_reduction;
+                                                                    pos.size = our_held_size
+                                                                        - our_reduction;
                                                                 }
                                                                 if partial_pnl >= Decimal::ZERO {
                                                                     guard.record_win(
