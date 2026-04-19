@@ -72,7 +72,65 @@ default_limit = 20.0        # 未分类市场的默认上限（USDC），设为 
 
 ---
 
-## 3. 本地止损止盈（`[stop_loss]`，config.example.toml 中已有）
+## 3. 动态分级止损止盈（`[stop_loss]` + `[stop_loss_tiers]`）
+
+**功能**：按入场价格分档，自动执行三级止损 + 跟踪止盈。完全配置化，无硬编码。
+
+### 三级止损逻辑
+
+| 阶段 | 触发条件 | 行为 |
+|------|----------|------|
+| **初始止损** | 价格跌破 `entry × (1 - initial_sl_pct)` | 立即以市价卖出 |
+| **保本止损** | 浮盈 ≥ 20% | SL 移动至盈亏平衡点 |
+| **锁利止损** | 浮盈 ≥ 50% | SL 锁定 +20% 利润 |
+
+### 跟踪止盈逻辑
+
+当浮盈 ≥ `tp_activate_pct` 时激活，之后跟踪价格峰值，从峰值回落超过 `tp_drawdown_pct` 时触发止盈卖出。
+
+### 按价格档位配置
+
+```toml
+[stop_loss]
+enabled = true
+force_stop_price = 0.15   # 跌破 $0.15 → 强制止损（所有档位生效）
+force_close_price = 0.95   # 升到 $0.95 → 强制止盈（所有档位生效）
+check_interval_secs = 3
+
+[stop_loss_tiers]
+# 档位由入场价格决定：
+#   < $0.40 → tier1   |   < $0.55 → tier2   |   < $0.70 → tier3   |   >= $0.70 → tier4
+
+# Tier 1 — 深冷门（< $0.40）：容忍更大波动，更晚激活 TP
+tier1_max_entry = 0.40
+tier1_initial_sl_pct = 0.20    # 初始止损 20%
+tier1_tp_activate_pct = 0.80   # 浮盈 80% 后开始跟踪止盈
+tier1_drawdown_pct = 0.15      # 从峰值回落 15% 触发止盈
+
+# Tier 2 — 中冷门（< $0.55）
+tier2_max_entry = 0.55
+tier2_initial_sl_pct = 0.15
+tier2_tp_activate_pct = 0.60
+tier2_drawdown_pct = 0.12
+
+# Tier 3 — 偏热门（< $0.70）
+tier3_max_entry = 0.70
+tier3_initial_sl_pct = 0.12
+tier3_tp_activate_pct = 0.40
+tier3_drawdown_pct = 0.10
+
+# Tier 4 — 强热门（>= $0.70）：敏感止损，早激活 TP
+tier4_max_entry = 1.00
+tier4_initial_sl_pct = 0.10
+tier4_tp_activate_pct = 0.25
+tier4_drawdown_pct = 0.08
+```
+
+### 特殊规则
+
+- **临近到期（< 4 小时）**：`tp_activate_pct` 和 `tp_drawdown_pct` 均减半（更紧跟踪）
+- **价格大幅波动（> 30%）**：`drawdown_pct` 放宽 +5%（容忍更大回撤）
+- **Force Lines**：`force_stop_price`（$0.15）和 `force_close_price`（$0.95）始终生效，与档位无关
 
 **功能**：对已持有的仓位，实时监控价格，触发条件时强制以市价卖出。
 
@@ -111,7 +169,7 @@ max_slippage_pct = 0.02   # 滑点上限 2%，超出则拒绝挂单
 |---|---|
 | PnL Chart | ✅ 自动，无需操作 |
 | 按类别仓位上限 | `config.toml` → `[risk_by_category]` → `enabled = true` |
-| 本地止损止盈 | `config.toml` → `[stop_loss]` → `enabled = true` |
+| 动态分级止损止盈 | `config.toml` → `[stop_loss]` → `enabled = true`，参数在 `[stop_loss_tiers]` |
 | 滑点保护 | `config.toml` → `[execution.max_slippage_pct]` |
 | 洗盘过滤 | ✅ 自动，无需操作 |
 
