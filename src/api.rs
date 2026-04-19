@@ -656,7 +656,7 @@ async fn get_csv_export(State(api_state): State<ApiState>) -> impl IntoResponse 
 async fn get_sl_status(
     State(api_state): State<ApiState>,
 ) -> Json<Vec<crate::stop_loss::TrackedPositionStatus>> {
-    // Get current prices from BotState
+    // Get current prices from BotState (same source as the SL monitor loop)
     let current_prices: HashMap<String, Decimal> = {
         let bot = api_state.bot_state.read().await;
         let mut prices = HashMap::new();
@@ -667,6 +667,12 @@ async fn get_sl_status(
                 .find(|tp| &tp.token_id == token_id)
             {
                 prices.insert(token_id.clone(), tp.cur_price);
+            }
+        }
+        // Also include prices from pending_orders for tokens not in target_positions
+        for (tid, pending) in &bot.pending_orders {
+            if !prices.contains_key(tid) {
+                prices.insert(tid.clone(), pending.price);
             }
         }
         prices

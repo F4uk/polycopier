@@ -23,8 +23,8 @@
 //! - Price > 0.95 → immediate exit (avoid last-minute crash)
 //!
 //! **Special conditions**:
-//! - Market ends < 4h: TP threshold halved, drawdown halved
-//! - Daily volatility > 30%: drawdown +5%
+//! - Market ends < 4h: TP threshold halved, drawdown halved (tighter trailing when active)
+//! - Price swing > 30% from entry: drawdown +5% (wider room for volatile moves)
 //! - SL and TP run in parallel, whichever triggers first wins
 
 use crate::clients::OrderSubmitter;
@@ -35,7 +35,6 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -330,7 +329,6 @@ pub fn start_stop_loss_monitor(
         );
 
         let mut interval = tokio::time::interval(check_interval);
-        let mut prev_prices: HashMap<String, Decimal> = HashMap::new();
 
         loop {
             interval.tick().await;
@@ -391,6 +389,8 @@ pub fn start_stop_loss_monitor(
 
                 if near_expiry && !tracked_pos.trailing_activated {
                     // Halve TP threshold and drawdown when market ends < 4h
+                    // Only apply if trailing hasn't activated yet — once active,
+                    // the drawdown threshold is already set and shouldn't change.
                     tracked_pos.effective_tp_activate_pct =
                         tracked_pos.tier.tp_activate_pct / dec!(2);
                     tracked_pos.effective_drawdown_pct = tracked_pos.tier.tp_drawdown_pct / dec!(2);
@@ -399,24 +399,34 @@ pub fn start_stop_loss_monitor(
                         pos.effective_tp_activate_pct = tracked_pos.effective_tp_activate_pct;
                         pos.effective_drawdown_pct = tracked_pos.effective_drawdown_pct;
                     }
-                }
-
-                // ── Special condition: high volatility boost ──────────────────
-                let prev = prev_prices.get(&tracked_pos.token_id).copied();
-                if let Some(prev_p) = prev {
-                    if prev_p > Decimal::ZERO {
-                        let daily_move = ((cur_price - prev_p) / prev_p).abs();
-                        if daily_move > dec!(0.30) {
-                            tracked_pos.effective_drawdown_pct =
-                                tracked_pos.tier.tp_drawdown_pct + dec!(0.05);
-                            let mut guard = sl_state.lock().await;
-                            if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
-                                pos.effective_drawdown_pct = tracked_pos.effective_drawdown_pct;
-                            }
+                } else if near_expiry && tracked_pos.trailing_activated {
+                    // Near-expiry but trailing already active: only halve drawdown
+                    // to tighten the trailing stop without resetting the activation state.
+                    let halved_drawdown = tracked_pos.tier.tp_drawdown_pct / dec!(2);
+                    if halved_drawdown < tracked_pos.effective_drawdown_pct {
+                        tracked_pos.effective_drawdown_pct = halved_drawdown;
+                        let mut guard = sl_state.lock().await;
+                        if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                            pos.effective_drawdown_pct = halved_drawdown;
                         }
                     }
                 }
-                prev_prices.insert(tracked_pos.token_id.clone(), cur_price);
+
+                // ── Special condition: high volatility boost ──────────────────
+                // Use actual price swing from entry (not inter-check delta which
+                // is only seconds apart and not meaningful as "daily" volatility).
+                if tracked_pos.entry_price > Decimal::ZERO {
+                    let move_from_entry =
+                        ((cur_price - tracked_pos.entry_price) / tracked_pos.entry_price).abs();
+                    if move_from_entry > dec!(0.30) {
+                        tracked_pos.effective_drawdown_pct =
+                            tracked_pos.tier.tp_drawdown_pct + dec!(0.05);
+                        let mut guard = sl_state.lock().await;
+                        if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                            pos.effective_drawdown_pct = tracked_pos.effective_drawdown_pct;
+                        }
+                    }
+                }
 
                 // ── Force stop: price < force_stop_price ─────────────────────
                 if cur_price < force_stop {
@@ -642,8 +652,12 @@ async fn close_position(
         return;
     }
 
-    // Market sell via Polymarket SDK — price 0.99 ensures fill
-    let sell_price = Decimal::from_str("0.99").unwrap_or(dec!(0.99));
+    // Market sell via Polymarket SDK — use current price + 2% slippage buffer.
+    // For very low-priced tokens, ensure at least 0.01 floor; cap at 0.99.
+    let slippage = dec!(0.02);
+    let sell_price = ((exit_price * (Decimal::ONE + slippage)).round_dp(2))
+        .max(dec!(0.01))
+        .min(dec!(0.99));
     let order = OrderRequest {
         token_id: token_id.to_string(),
         price: sell_price,

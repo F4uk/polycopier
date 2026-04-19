@@ -237,7 +237,6 @@ pub struct Config {
     pub chain_id: u64,
 
     // Target wallets (from config.toml [targets].wallets)
-    // Target wallets (from config.toml [targets].wallets)
     pub target_wallets: Vec<String>,
     pub target_scalars: std::collections::HashMap<String, Decimal>,
 
@@ -593,7 +592,10 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
             retention_days: u32v("LEDGER_RETENTION_DAYS", defaults.ledger.retention_days),
         },
         stop_loss: StopLossConfig {
-            enabled: true,
+            enabled: env::var("STOP_LOSS_ENABLED")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(defaults.stop_loss.enabled),
             force_stop_price: dec("FORCE_STOP_PRICE", defaults.stop_loss.force_stop_price),
             force_close_price: dec("FORCE_CLOSE_PRICE", defaults.stop_loss.force_close_price),
             check_interval_secs: u64v(
