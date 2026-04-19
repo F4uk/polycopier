@@ -104,6 +104,8 @@ pub struct BotState {
     pub token_ownership_strategy: String,
     /// Whether partial close is enabled.
     pub enable_partial_close: bool,
+    /// Whether running in simulation mode.
+    pub is_sim: bool,
 }
 
 const MUTED_FILE: &str = "muted_markets.json";
@@ -169,6 +171,7 @@ impl BotState {
             pnl_history: Vec::new(),
             token_ownership_strategy: "first_come".to_string(),
             enable_partial_close: true,
+            is_sim,
         }
     }
 

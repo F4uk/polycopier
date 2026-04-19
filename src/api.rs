@@ -73,6 +73,7 @@ pub fn create_setup_router() -> Router {
 pub struct SetupPayload {
     pub private_key: String,
     pub funder_address: String,
+    pub target_wallets: Option<Vec<String>>,
 }
 
 async fn handle_setup(Json(payload): Json<SetupPayload>) -> axum::response::Response {
@@ -84,8 +85,9 @@ async fn handle_setup(Json(payload): Json<SetupPayload>) -> axum::response::Resp
         let _ = writeln!(env_file, "FUNDER_ADDRESS=\"{}\"", payload.funder_address);
     }
 
+    let wallets = payload.target_wallets.unwrap_or_default();
     let default_cfg = BotConfig {
-        targets: TargetsConfig { wallets: vec![] },
+        targets: TargetsConfig { wallets },
         ..Default::default()
     };
     let _ = crate::config::write_toml(&default_cfg);
@@ -237,7 +239,7 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
         wallet_blacklist: guard.wallet_blacklist.iter().cloned().collect(),
         perf: guard.perf.clone(),
         pnl_history: guard.pnl_history.clone(),
-        is_sim: false, // will be overridden by caller if needed
+        is_sim: guard.is_sim,
         sl_status: {
             let sl_guard = api_state.sl_state.lock().await;
             sl_guard.get_all_status(&{

@@ -996,11 +996,17 @@ impl Config {
                  Set it in .env or re-run to be prompted."
             );
         }
-        if toml_cfg.targets.wallets.is_empty() && !is_ui {
-            anyhow::bail!(
-                "No target wallets configured.\n\
-                 Add addresses to [targets].wallets in config.toml or re-run to be prompted."
-            );
+        if toml_cfg.targets.wallets.is_empty() {
+            if is_ui {
+                tracing::warn!(
+                    "No target wallets configured. Use the Settings page to add target wallets, then restart."
+                );
+            } else {
+                anyhow::bail!(
+                    "No target wallets configured.\n\
+                     Add addresses to [targets].wallets in config.toml or re-run to be prompted."
+                );
+            }
         }
 
         Ok(Self::from_parts(private_key, funder_address, toml_cfg))

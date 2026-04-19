@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 export default function SetupWizard() {
   const [privateKey, setPrivateKey] = useState('');
   const [funderAddress, setFunderAddress] = useState('');
+  const [targetWallets, setTargetWallets] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
@@ -11,6 +12,10 @@ export default function SetupWizard() {
     e.preventDefault();
     if (!privateKey.trim() || !funderAddress.trim()) {
       setError('Private Key and Funder Address are required.');
+      return;
+    }
+    if (!targetWallets.trim()) {
+      setError('At least one Target Wallet is required to start copy-trading.');
       return;
     }
 
@@ -26,6 +31,7 @@ export default function SetupWizard() {
         body: JSON.stringify({
           private_key: privateKey.trim(),
           funder_address: funderAddress.trim(),
+          target_wallets: targetWallets.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0),
         }),
       });
 
@@ -66,7 +72,7 @@ export default function SetupWizard() {
         <div style={{ marginBottom: '1.5rem', textAlign: 'center', borderBottom: '1px solid var(--panel-border)', paddingBottom: '1rem' }}>
           <h2 style={{ fontSize: '1.5rem', fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 0.5rem 0' }}>Polycopier Setup</h2>
           <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', lineHeight: 1.4 }}>
-            Welcome! Please configure your secure credentials to initialize the bot. Target Wallets can be managed in the Dashboard later.
+            Welcome! Configure your credentials and target wallets to start copy-trading.
           </div>
         </div>
 
@@ -105,6 +111,18 @@ export default function SetupWizard() {
               style={{ width: '100%' }}
             />
             <span className="field-hint">Your signing wallet private key (e.g. 0x...)</span>
+          </div>
+
+          <div className="form-group">
+            <label>Target Wallets</label>
+            <input 
+              type="text" 
+              value={targetWallets}
+              onChange={(e) => setTargetWallets(e.target.value)}
+              placeholder="0xWallet1, 0xWallet2..."
+              style={{ width: '100%' }}
+            />
+            <span className="field-hint">Wallet addresses to copy-trade (comma separated, e.g. 0xabc..., 0xdef...)</span>
           </div>
 
           <button 
