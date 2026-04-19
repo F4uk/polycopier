@@ -288,11 +288,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── Background tasks ──────────────────────────────────────────────────────
-    // Seed OUR positions AND live GTC orders before starting the scanner.
-    // Both must complete so the scanner's first run sees accurate SkippedOwned
-    // and already-queued state — preventing duplicate orders on restart.
+    // Seed OUR positions so the scanner's first run sees accurate SkippedOwned
+    // state — preventing duplicate orders on restart.
+    // In sim mode we also seed positions so the UI and strategy engine have
+    // data to work with (otherwise state.positions stays empty forever).
+    wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await;
+    // seed_pending_orders only applies to real mode (cancels stale CLOB orders).
     if !config.is_sim {
-        wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await;
         wallet_sync::seed_pending_orders(&clob, state.clone()).await;
     }
 

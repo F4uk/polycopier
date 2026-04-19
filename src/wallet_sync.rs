@@ -106,13 +106,7 @@ pub fn start_position_sync(
     state: State,
     copy_ledger: Arc<Mutex<CopyLedger>>,
 ) {
-    if config.is_sim {
-        tracing::warn!(
-            "Simulation Mode: skipping start_position_sync (assuming instant exact fills)."
-        );
-        return;
-    }
-
+    let is_sim = config.is_sim;
     let funder = config.funder_address.clone();
     tokio::spawn(async move {
         let client = DataClient::default();
@@ -125,14 +119,30 @@ pub fn start_position_sync(
                 match crate::utils::fetch_all_positions(&client, addr).await {
                     Ok(positions) => {
                         consecutive_errors = 0;
+
+                        // In sim mode: only insert positions that were placed by the
+                        // strategy engine's is_sim block (already in state.positions).
+                        // We must NOT clear and replace because sim positions are
+                        // tracked locally and may differ from the on-chain wallet.
+                        // In live mode: clear and rebuild from API (original behavior).
                         let mut guard = state.write().await;
-                        guard.positions.clear();
+                        if !is_sim {
+                            guard.positions.clear();
+                        }
                         for p in &positions {
                             if p.redeemable
                                 || p.cur_price == Decimal::ZERO
                                 || p.size <= Decimal::ZERO
                             {
                                 continue;
+                            }
+                            if is_sim {
+                                // In sim mode, only update existing positions' sizes
+                                // (partial fills) but never overwrite or add positions
+                                // that the sim engine hasn't explicitly created.
+                                if let Some(existing) = guard.positions.get_mut(&p.asset.to_string()) {
+                                    existing.size = p.size;
+                                }
                             } else {
                                 guard.positions.insert(
                                     p.asset.to_string(),
@@ -147,14 +157,17 @@ pub fn start_position_sync(
                         drop(guard);
 
                         // Gap 4: update ledger fill sizes for partial fills.
-                        let mut ledger = copy_ledger.lock().await;
-                        for p in &positions {
-                            if p.redeemable || p.cur_price == Decimal::ZERO {
-                                continue;
+                        // In sim mode, skip ledger updates (sim uses instant exact fills).
+                        if !is_sim {
+                            let mut ledger = copy_ledger.lock().await;
+                            for p in &positions {
+                                if p.redeemable || p.cur_price == Decimal::ZERO {
+                                    continue;
+                                }
+                                let token_id = p.asset.to_string();
+                                // update_fill is a no-op if sizes already match or no entry exists.
+                                ledger.update_fill(&token_id, p.size);
                             }
-                            let token_id = p.asset.to_string();
-                            // update_fill is a no-op if sizes already match or no entry exists.
-                            ledger.update_fill(&token_id, p.size);
                         }
                     }
                     Err(e) => {
