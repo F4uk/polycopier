@@ -95,16 +95,26 @@ async fn handle_setup(Json(payload): Json<SetupPayload>) -> axum::response::Resp
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let exe = std::env::current_exe().unwrap();
+        let orig_args: Vec<String> = std::env::args().collect();
+
+        // Replace --ui with --ui-reboot (suppress browser re-open), keep all other args
+        let mut new_args: Vec<String> = orig_args[1..]
+            .iter()
+            .filter(|a| *a != "--ui")
+            .cloned()
+            .collect();
+        new_args.push("--ui-reboot".to_string());
 
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&exe).arg("--ui-reboot").exec();
+            tracing::info!("Setup complete — rebooting with args: {:?}", new_args);
+            let err = std::process::Command::new(&exe).args(&new_args).exec();
             tracing::error!("Seamless setup reboot failed: {}", err);
         }
         #[cfg(not(unix))]
         {
-            let _ = std::process::Command::new(&exe).arg("--ui-reboot").spawn();
+            let _ = std::process::Command::new(&exe).args(&new_args).spawn();
             std::process::exit(0);
         }
     });

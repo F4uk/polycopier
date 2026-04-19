@@ -34,10 +34,25 @@ export default function SetupWizard() {
       }
 
       setSuccess(true);
-      // Wait a moment for the backend to hot-reboot, then refresh
-      setTimeout(() => {
+      // Wait for the backend to hot-reboot, then poll until the API is ready
+      const waitForDaemon = async () => {
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          try {
+            const res = await fetch('/api/state');
+            const data = await res.json();
+            if (data.status !== 'setup_required') {
+              window.location.reload();
+              return;
+            }
+          } catch {
+            // Daemon not ready yet, keep waiting
+          }
+        }
+        // Fallback: reload after 30s anyway
         window.location.reload();
-      }, 2000);
+      };
+      waitForDaemon();
 
     } catch (err: any) {
       setError(err.message || 'An error occurred during setup');
