@@ -28,7 +28,7 @@
 //! - SL and TP run in parallel, whichever triggers first wins
 
 use crate::clients::OrderSubmitter;
-use crate::config::Config;
+use crate::config::{Config, StopLossTiersConfig};
 use crate::models::{OrderRequest, TradeSide};
 use crate::state::BotState;
 use rust_decimal::Decimal;
@@ -54,32 +54,21 @@ pub struct PriceTier {
     pub tp_drawdown_pct: Decimal,
 }
 
-/// Select the price tier based on entry price.
-fn get_tier(entry_price: Decimal) -> PriceTier {
-    if entry_price < dec!(0.40) {
-        PriceTier {
-            initial_sl_pct: dec!(0.20),
-            tp_activate_pct: dec!(0.80),
-            tp_drawdown_pct: dec!(0.15),
-        }
-    } else if entry_price < dec!(0.55) {
-        PriceTier {
-            initial_sl_pct: dec!(0.15),
-            tp_activate_pct: dec!(0.60),
-            tp_drawdown_pct: dec!(0.12),
-        }
-    } else if entry_price < dec!(0.70) {
-        PriceTier {
-            initial_sl_pct: dec!(0.12),
-            tp_activate_pct: dec!(0.40),
-            tp_drawdown_pct: dec!(0.10),
-        }
+/// Select the price tier based on entry price, driven by user-configurable [stop_loss_tiers].
+fn get_tier(entry_price: Decimal, tiers: &StopLossTiersConfig) -> PriceTier {
+    let tier = if entry_price < tiers.tier1.max_entry {
+        &tiers.tier1
+    } else if entry_price < tiers.tier2.max_entry {
+        &tiers.tier2
+    } else if entry_price < tiers.tier3.max_entry {
+        &tiers.tier3
     } else {
-        PriceTier {
-            initial_sl_pct: dec!(0.10),
-            tp_activate_pct: dec!(0.25),
-            tp_drawdown_pct: dec!(0.08),
-        }
+        &tiers.tier4
+    };
+    PriceTier {
+        initial_sl_pct: tier.initial_sl_pct,
+        tp_activate_pct: tier.tp_activate_pct,
+        tp_drawdown_pct: tier.tp_drawdown_pct,
     }
 }
 
@@ -184,6 +173,8 @@ pub struct StopLossState {
     pub force_close_price: Decimal,
     /// Check interval in seconds.
     pub check_interval_secs: u64,
+    /// User-configurable price-tier parameters for dynamic SL/TP.
+    pub tiers: StopLossTiersConfig,
     /// Tracked positions keyed by token_id.
     pub positions: HashMap<String, TrackedPosition>,
 }
@@ -194,19 +185,21 @@ impl StopLossState {
         force_stop_price: Decimal,
         force_close_price: Decimal,
         check_interval_secs: u64,
+        tiers: StopLossTiersConfig,
     ) -> Self {
         Self {
             enabled,
             force_stop_price,
             force_close_price,
             check_interval_secs,
+            tiers,
             positions: HashMap::new(),
         }
     }
 
     /// Record a new entry so the monitor can watch it.
     pub fn record_entry(&mut self, token_id: String, entry_price: Decimal) {
-        let tier = get_tier(entry_price);
+        let tier = get_tier(entry_price, &self.tiers);
         let current_sl_price = entry_price * (Decimal::ONE - tier.initial_sl_pct);
         let tp_activate_price = entry_price * (Decimal::ONE + tier.tp_activate_pct);
 

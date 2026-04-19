@@ -44,6 +44,7 @@ pub struct BotConfig {
     pub risk: RiskConfig,
     pub ledger: LedgerConfig,
     pub stop_loss: StopLossConfig,
+    pub stop_loss_tiers: StopLossTiersConfig,
     pub risk_guard: RiskGuardConfig,
     pub market_filter: MarketFilterConfig,
     pub telegram: TelegramConfig,
@@ -110,8 +111,34 @@ pub struct LedgerConfig {
     pub retention_days: u32,
 }
 
+/// Per-tier parameters for dynamic SL/TP — maps entry price ranges to risk settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlTierConfig {
+    /// Upper bound of entry price for this tier (e.g. 0.40 means entries < $0.40 use this tier).
+    pub max_entry: Decimal,
+    /// Initial stop-loss: exit if price falls more than this % below entry (e.g. 0.20 = 20%).
+    pub initial_sl_pct: Decimal,
+    /// Trailing TP activate threshold: start trailing when profit exceeds this % (e.g. 0.80 = 80%).
+    pub tp_activate_pct: Decimal,
+    /// Allowed drawdown from peak after trailing TP activates (e.g. 0.15 = 15% from peak).
+    pub tp_drawdown_pct: Decimal,
+}
+
+/// Dynamic tiered stop-loss / trailing take-profit config.
+/// Each entry price tier maps to specific SL/TP parameters — no tier config = use built-in defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopLossTiersConfig {
+    /// Tier 1: entry price < threshold_1 (e.g. < $0.40)
+    pub tier1: SlTierConfig,
+    /// Tier 2: entry price < threshold_2 (e.g. < $0.55)
+    pub tier2: SlTierConfig,
+    /// Tier 3: entry price < threshold_3 (e.g. < $0.70)
+    pub tier3: SlTierConfig,
+    /// Tier 4: entry price >= threshold_3 (e.g. >= $0.70)
+    pub tier4: SlTierConfig,
+}
+
 /// Dynamic tiered stop-loss / take-profit monitoring config.
-/// Parameters are auto-selected by entry price tier (Polymarket binary options).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopLossConfig {
     /// Enable local stop-loss / take-profit monitoring.
@@ -230,6 +257,32 @@ impl Default for BotConfig {
                 force_close_price: Decimal::from_str("0.95").unwrap(),
                 check_interval_secs: 3,
             },
+            stop_loss_tiers: StopLossTiersConfig {
+                tier1: SlTierConfig {
+                    max_entry: Decimal::from_str("0.40").unwrap(),
+                    initial_sl_pct: Decimal::from_str("0.20").unwrap(),
+                    tp_activate_pct: Decimal::from_str("0.80").unwrap(),
+                    tp_drawdown_pct: Decimal::from_str("0.15").unwrap(),
+                },
+                tier2: SlTierConfig {
+                    max_entry: Decimal::from_str("0.55").unwrap(),
+                    initial_sl_pct: Decimal::from_str("0.15").unwrap(),
+                    tp_activate_pct: Decimal::from_str("0.60").unwrap(),
+                    tp_drawdown_pct: Decimal::from_str("0.12").unwrap(),
+                },
+                tier3: SlTierConfig {
+                    max_entry: Decimal::from_str("0.70").unwrap(),
+                    initial_sl_pct: Decimal::from_str("0.12").unwrap(),
+                    tp_activate_pct: Decimal::from_str("0.40").unwrap(),
+                    tp_drawdown_pct: Decimal::from_str("0.10").unwrap(),
+                },
+                tier4: SlTierConfig {
+                    max_entry: Decimal::from_str("1.00").unwrap(),
+                    initial_sl_pct: Decimal::from_str("0.10").unwrap(),
+                    tp_activate_pct: Decimal::from_str("0.25").unwrap(),
+                    tp_drawdown_pct: Decimal::from_str("0.08").unwrap(),
+                },
+            },
             risk_guard: RiskGuardConfig {
                 max_daily_loss_pct: Decimal::from_str("0.15").unwrap(),
                 max_single_loss_usd: Decimal::from_str("5.0").unwrap(),
@@ -308,6 +361,7 @@ pub struct Config {
     pub force_stop_price: Decimal,
     pub force_close_price: Decimal,
     pub stop_loss_check_interval_secs: u64,
+    pub sl_tiers: StopLossTiersConfig,
     // Risk guard tunables
     pub max_daily_loss_pct: Decimal,
     pub max_single_loss_usd: Decimal,
@@ -457,6 +511,28 @@ force_close_price = {force_close}
 # How often (seconds) to check price levels
 check_interval_secs = {sl_interval}
 
+[stop_loss_tiers]
+# Tier 1: entry price < tier1.max_entry
+tier1_max_entry = {t1_max}
+tier1_initial_sl_pct = {t1_sl}
+tier1_tp_activate_pct = {t1_tp}
+tier1_drawdown_pct = {t1_dd}
+# Tier 2: entry price < tier2.max_entry
+tier2_max_entry = {t2_max}
+tier2_initial_sl_pct = {t2_sl}
+tier2_tp_activate_pct = {t2_tp}
+tier2_drawdown_pct = {t2_dd}
+# Tier 3: entry price < tier3.max_entry
+tier3_max_entry = {t3_max}
+tier3_initial_sl_pct = {t3_sl}
+tier3_tp_activate_pct = {t3_tp}
+tier3_drawdown_pct = {t3_dd}
+# Tier 4: entry price >= tier3.max_entry
+tier4_max_entry = {t4_max}
+tier4_initial_sl_pct = {t4_sl}
+tier4_tp_activate_pct = {t4_tp}
+tier4_drawdown_pct = {t4_dd}
+
 [risk_guard]
 # Max daily loss as fraction of starting balance (0.15 = 15%). Triggers auto-close + freeze.
 max_daily_loss_pct = {rg_daily_loss}
@@ -540,6 +616,22 @@ default_limit = {rbc_default}
         force_stop = cfg.stop_loss.force_stop_price,
         force_close = cfg.stop_loss.force_close_price,
         sl_interval = cfg.stop_loss.check_interval_secs,
+        t1_max = cfg.stop_loss_tiers.tier1.max_entry,
+        t1_sl = cfg.stop_loss_tiers.tier1.initial_sl_pct,
+        t1_tp = cfg.stop_loss_tiers.tier1.tp_activate_pct,
+        t1_dd = cfg.stop_loss_tiers.tier1.tp_drawdown_pct,
+        t2_max = cfg.stop_loss_tiers.tier2.max_entry,
+        t2_sl = cfg.stop_loss_tiers.tier2.initial_sl_pct,
+        t2_tp = cfg.stop_loss_tiers.tier2.tp_activate_pct,
+        t2_dd = cfg.stop_loss_tiers.tier2.tp_drawdown_pct,
+        t3_max = cfg.stop_loss_tiers.tier3.max_entry,
+        t3_sl = cfg.stop_loss_tiers.tier3.initial_sl_pct,
+        t3_tp = cfg.stop_loss_tiers.tier3.tp_activate_pct,
+        t3_dd = cfg.stop_loss_tiers.tier3.tp_drawdown_pct,
+        t4_max = cfg.stop_loss_tiers.tier4.max_entry,
+        t4_sl = cfg.stop_loss_tiers.tier4.initial_sl_pct,
+        t4_tp = cfg.stop_loss_tiers.tier4.tp_activate_pct,
+        t4_dd = cfg.stop_loss_tiers.tier4.tp_drawdown_pct,
         rg_daily_loss = cfg.risk_guard.max_daily_loss_pct,
         rg_single_loss = cfg.risk_guard.max_single_loss_usd,
         rg_consec = cfg.risk_guard.wallet_blacklist_consecutive_losses,
@@ -690,6 +782,7 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
                 defaults.stop_loss.check_interval_secs,
             ),
         },
+        stop_loss_tiers: defaults.stop_loss_tiers.clone(),
         risk_guard: RiskGuardConfig {
             max_daily_loss_pct: dec("MAX_DAILY_LOSS_PCT", defaults.risk_guard.max_daily_loss_pct),
             max_single_loss_usd: dec(
@@ -963,6 +1056,7 @@ impl Config {
             force_stop_price: cfg.stop_loss.force_stop_price,
             force_close_price: cfg.stop_loss.force_close_price,
             stop_loss_check_interval_secs: cfg.stop_loss.check_interval_secs,
+            sl_tiers: cfg.stop_loss_tiers.clone(),
             max_daily_loss_pct: cfg.risk_guard.max_daily_loss_pct,
             max_single_loss_usd: cfg.risk_guard.max_single_loss_usd,
             wallet_blacklist_consecutive_losses: cfg.risk_guard.wallet_blacklist_consecutive_losses,

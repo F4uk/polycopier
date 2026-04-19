@@ -246,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
         config.force_stop_price,
         config.force_close_price,
         config.stop_loss_check_interval_secs,
+        config.sl_tiers.clone(),
     )));
 
     let (poly_submitter, balance_fetcher, clob) = if config.is_sim {

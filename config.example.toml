@@ -67,6 +67,35 @@ force_close_price = 0.95
 # Check interval (seconds)
 check_interval_secs = 3
 
+[stop_loss_tiers]
+# ── Dynamic tiered stop-loss / trailing take-profit ──────────────────────────
+# Configures per-entry-price-tier SL/TP parameters.
+# Each tier activates based on entry price: < tier1_max_entry → tier 1, etc.
+# SL tiers advance: Initial → Breakeven (≥20% profit) → Lock 20% (≥50% profit).
+# Trailing TP activates when profit ≥ tp_activate_pct, then trails with tp_drawdown_pct.
+# Force lines (force_stop_price / force_close_price) always apply regardless of tier.
+#
+# Tier 1 — Deep underdog entries (< tier1_max_entry, e.g. < $0.40)
+tier1_max_entry = 0.40
+tier1_initial_sl_pct = 0.20
+tier1_tp_activate_pct = 0.80
+tier1_drawdown_pct = 0.15
+# Tier 2 — Medium underdog entries (< tier2_max_entry, e.g. < $0.55)
+tier2_max_entry = 0.55
+tier2_initial_sl_pct = 0.15
+tier2_tp_activate_pct = 0.60
+tier2_drawdown_pct = 0.12
+# Tier 3 — Favourite entries (< tier3_max_entry, e.g. < $0.70)
+tier3_max_entry = 0.70
+tier3_initial_sl_pct = 0.12
+tier3_tp_activate_pct = 0.40
+tier3_drawdown_pct = 0.10
+# Tier 4 — Strong favourite entries (>= tier3_max_entry, e.g. >= $0.70)
+tier4_max_entry = 1.00
+tier4_initial_sl_pct = 0.10
+tier4_tp_activate_pct = 0.25
+tier4_drawdown_pct = 0.08
+
 [trading]
 # Token ownership strategy: first_come | win_rate_priority | multi_wallet_average | whitelist_only
 #   first_come         -- first wallet to BUY owns the token (original behavior)
