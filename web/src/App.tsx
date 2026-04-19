@@ -364,8 +364,26 @@ function App() {
             <div className="glass-panel">
               <div className="panel-header">
                 Target Positions (Scanning / Watching)
-                <span className="panel-subtitle">Total Scanned: {targets.length}</span>
+                <span className="panel-subtitle">Total Scanned: {targets.length} {state.target_wallets?.length > 0 ? `| Wallets: ${state.target_wallets.length}` : ''}</span>
               </div>
+              {targets.length === 0 && (
+                <div style={{ padding:'1rem',textAlign:'center',color:'var(--text-secondary)',fontSize:'0.875rem' }}>
+                  {(!state.target_wallets || state.target_wallets.length === 0) ? (
+                    <>
+                      <div style={{ color:'#fbbf24',fontWeight:600,marginBottom:'0.5rem' }}>No target wallets configured</div>
+                      <div>Go to <strong>Settings & Env</strong> → <strong>Targets Network</strong> → add wallet addresses, then <strong>Save & Restart</strong>.</div>
+                    </>
+                  ) : state.next_scan_secs > 0 ? (
+                    <>
+                      <div style={{ color:'#60a5fa',fontWeight:600,marginBottom:'0.5rem' }}>Scanner running — next scan in {state.next_scan_secs}s</div>
+                      <div>Target wallets: {state.target_wallets.map((w: string) => `${w.slice(0,6)}...${w.slice(-4)}`).join(', ')}</div>
+                      <div style={{ marginTop:'0.5rem',opacity:0.7 }}>If positions stay at 0, check that target wallets have active positions on Polymarket and the API is reachable.</div>
+                    </>
+                  ) : (
+                    <div style={{ color:'#f87171' }}>Scanner may have failed — check backend logs for API errors</div>
+                  )}
+                </div>
+              )}
               <div className="table-container" style={{ maxHeight: '400px', overflowY: 'auto' }}>
                 <table>
                   <thead>

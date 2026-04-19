@@ -106,6 +106,9 @@ pub struct BotState {
     pub enable_partial_close: bool,
     /// Whether running in simulation mode.
     pub is_sim: bool,
+    /// Target wallet addresses the scanner is currently tracking.
+    /// Populated at startup from config.toml. Updated when config is hot-reloaded.
+    pub target_wallets: Vec<String>,
 }
 
 const MUTED_FILE: &str = "muted_markets.json";
@@ -172,6 +175,7 @@ impl BotState {
             token_ownership_strategy: "first_come".to_string(),
             enable_partial_close: true,
             is_sim,
+            target_wallets: Vec::new(),
         }
     }
 

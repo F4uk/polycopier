@@ -323,6 +323,12 @@ async fn main() -> anyhow::Result<()> {
         wallet_sync::start_balance_poll(balance_fetcher, state.clone());
     }
 
+    // Store target wallets in state so the API can expose them for diagnostics.
+    {
+        let mut g = state.write().await;
+        g.target_wallets = config.target_wallets.clone();
+    }
+
     // Position scanner — safe to start now; seed has completed.
     position_scanner::start_position_scanner(config.clone(), state.clone(), event_tx.clone());
 

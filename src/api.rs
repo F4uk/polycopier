@@ -167,6 +167,8 @@ pub struct StateResponse {
     pub pnl_history: Vec<PnlSnapshot>,
     /// Whether running in simulation mode.
     pub is_sim: bool,
+    /// Target wallet addresses the scanner is currently tracking.
+    pub target_wallets: Vec<String>,
     /// Stop-loss / take-profit tracked positions status.
     pub sl_status: Vec<crate::stop_loss::TrackedPositionStatus>,
     /// Token ownership strategy currently active.
@@ -240,6 +242,7 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
         perf: guard.perf.clone(),
         pnl_history: guard.pnl_history.clone(),
         is_sim: guard.is_sim,
+        target_wallets: guard.target_wallets.clone(),
         sl_status: {
             let sl_guard = api_state.sl_state.lock().await;
             sl_guard.get_all_status(&{
