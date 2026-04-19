@@ -60,11 +60,9 @@ retention_days = 90
 [stop_loss]
 # Enable local stop-loss / take-profit monitoring
 enabled = true
-# Fixed stop-loss percentage (0.10 = 10%)
-stop_loss_pct = 0.10
-# Target profit percentage — triggers trailing take-profit (0.35 = 35%)
-take_profit_pct = 0.35
-# Allowed drawdown from peak after trailing TP activation (0.10 = 10%)
-take_profit_drawdown_pct = 0.10
+# Force stop-loss: exit immediately if price drops below this (0.15 = $0.15)
+force_stop_price = 0.15
+# Force take-profit: exit immediately if price rises above this (0.95 = $0.95)
+force_close_price = 0.95
 # Check interval (seconds)
 check_interval_secs = 3

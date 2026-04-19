@@ -108,17 +108,16 @@ pub struct LedgerConfig {
     pub retention_days: u32,
 }
 
-/// Local stop-loss / take-profit monitoring config.
+/// Dynamic tiered stop-loss / take-profit monitoring config.
+/// Parameters are auto-selected by entry price tier (Polymarket binary options).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopLossConfig {
     /// Enable local stop-loss / take-profit monitoring.
     pub enabled: bool,
-    /// Exit when price drops this % below entry (e.g. 0.10 = 10%).
-    pub stop_loss_pct: Decimal,
-    /// Target profit % to activate trailing take-profit (e.g. 0.35 = 35%).
-    pub take_profit_pct: Decimal,
-    /// Allowed drawdown from peak after trailing TP activation (e.g. 0.10 = 10%).
-    pub take_profit_drawdown_pct: Decimal,
+    /// Force stop-loss: if price drops below this, exit immediately (e.g. 0.15).
+    pub force_stop_price: Decimal,
+    /// Force take-profit: if price rises above this, exit immediately (e.g. 0.95).
+    pub force_close_price: Decimal,
     /// How often (seconds) to check price levels. Default 3.
     pub check_interval_secs: u64,
 }
@@ -192,9 +191,8 @@ impl Default for BotConfig {
             ledger: LedgerConfig { retention_days: 90 },
             stop_loss: StopLossConfig {
                 enabled: true,
-                stop_loss_pct: Decimal::from_str("0.10").unwrap(),
-                take_profit_pct: Decimal::from_str("0.35").unwrap(),
-                take_profit_drawdown_pct: Decimal::from_str("0.10").unwrap(),
+                force_stop_price: Decimal::from_str("0.15").unwrap(),
+                force_close_price: Decimal::from_str("0.95").unwrap(),
                 check_interval_secs: 3,
             },
             risk_guard: RiskGuardConfig {
@@ -260,11 +258,10 @@ pub struct Config {
     pub max_daily_volume_usd: Decimal,
     pub max_consecutive_losses: u32,
     pub loss_cooldown_secs: u64,
-    // Stop-loss / take-profit tunables
+    // Stop-loss / take-profit tunables (dynamic tiered)
     pub stop_loss_enabled: bool,
-    pub stop_loss_pct: Decimal,
-    pub take_profit_pct: Decimal,
-    pub take_profit_drawdown_pct: Decimal,
+    pub force_stop_price: Decimal,
+    pub force_close_price: Decimal,
     pub stop_loss_check_interval_secs: u64,
     // Risk guard tunables
     pub max_daily_loss_pct: Decimal,
@@ -399,12 +396,10 @@ retention_days = {retention}
 [stop_loss]
 # Enable local stop-loss / take-profit monitoring
 enabled = {sl_enabled}
-# Stop-loss: exit when price drops this % below entry (0.10 = 10%)
-stop_loss_pct = {sl_pct}
-# Take-profit: target profit % to activate trailing (0.35 = 35%)
-take_profit_pct = {tp_pct}
-# Allowed drawdown from peak after trailing TP activation (0.10 = 10%)
-take_profit_drawdown_pct = {tp_drawdown}
+# Force stop-loss: exit immediately if price drops below this (0.15 = $0.15)
+force_stop_price = {force_stop}
+# Force take-profit: exit immediately if price rises above this (0.95 = $0.95)
+force_close_price = {force_close}
 # How often (seconds) to check price levels
 check_interval_secs = {sl_interval}
 
@@ -462,9 +457,8 @@ min_pnl_usd = {tg_pnl}
         cooldown = cfg.risk.loss_cooldown_secs,
         retention = cfg.ledger.retention_days,
         sl_enabled = cfg.stop_loss.enabled,
-        sl_pct = cfg.stop_loss.stop_loss_pct,
-        tp_pct = cfg.stop_loss.take_profit_pct,
-        tp_drawdown = cfg.stop_loss.take_profit_drawdown_pct,
+        force_stop = cfg.stop_loss.force_stop_price,
+        force_close = cfg.stop_loss.force_close_price,
         sl_interval = cfg.stop_loss.check_interval_secs,
         rg_daily_loss = cfg.risk_guard.max_daily_loss_pct,
         rg_single_loss = cfg.risk_guard.max_single_loss_usd,
@@ -600,12 +594,8 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
         },
         stop_loss: StopLossConfig {
             enabled: true,
-            stop_loss_pct: dec("STOP_LOSS_PCT", defaults.stop_loss.stop_loss_pct),
-            take_profit_pct: dec("TAKE_PROFIT_PCT", defaults.stop_loss.take_profit_pct),
-            take_profit_drawdown_pct: dec(
-                "TAKE_PROFIT_DRAWDOWN_PCT",
-                defaults.stop_loss.take_profit_drawdown_pct,
-            ),
+            force_stop_price: dec("FORCE_STOP_PRICE", defaults.stop_loss.force_stop_price),
+            force_close_price: dec("FORCE_CLOSE_PRICE", defaults.stop_loss.force_close_price),
             check_interval_secs: u64v(
                 "STOP_LOSS_CHECK_INTERVAL_SECS",
                 defaults.stop_loss.check_interval_secs,
@@ -857,9 +847,8 @@ impl Config {
             max_consecutive_losses: cfg.risk.max_consecutive_losses,
             loss_cooldown_secs: cfg.risk.loss_cooldown_secs,
             stop_loss_enabled: cfg.stop_loss.enabled,
-            stop_loss_pct: cfg.stop_loss.stop_loss_pct,
-            take_profit_pct: cfg.stop_loss.take_profit_pct,
-            take_profit_drawdown_pct: cfg.stop_loss.take_profit_drawdown_pct,
+            force_stop_price: cfg.stop_loss.force_stop_price,
+            force_close_price: cfg.stop_loss.force_close_price,
             stop_loss_check_interval_secs: cfg.stop_loss.check_interval_secs,
             max_daily_loss_pct: cfg.risk_guard.max_daily_loss_pct,
             max_single_loss_usd: cfg.risk_guard.max_single_loss_usd,

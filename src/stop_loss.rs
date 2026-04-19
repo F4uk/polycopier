@@ -1,19 +1,31 @@
-//! Local hard stop-loss / trailing take-profit module
+//! Dynamic tiered stop-loss + trailing take-profit module
 //!
-//! On each successful BUY entry the strategy engine calls `record_entry()`
-//! to save the entry price and the computed stop-loss price.
+//! Fully adapted for Polymarket binary options (0–1 USDC price range).
 //!
-//! **Stop-loss**: Fixed — exits when price drops `stop_loss_pct` below entry.
+//! **Dynamic stop-loss tiers** (by entry price):
+//! | Entry Price  | Initial SL | ≥20% profit → | ≥50% profit → |
+//! |--------------|-----------|---------------|---------------|
+//! | < 0.40       | 20%       | Breakeven     | Lock 20% gain |
+//! | 0.40–0.55    | 15%       | Breakeven     | Lock 20% gain |
+//! | 0.55–0.70    | 12%       | Breakeven     | Lock 20% gain |
+//! | > 0.70       | 10%       | Breakeven     | Lock 20% gain |
 //!
-//! **Trailing take-profit**:
-//!   a. After entry, only stop-loss is checked.
-//!   b. When profit ≥ `take_profit_pct` (e.g. 35%), trailing is **activated**.
-//!   c. The highest price seen since activation is tracked as `peak_price`.
-//!   d. Every check interval: if price drops ≥ `take_profit_drawdown_pct`
-//!      from `peak_price`, exit immediately.
-//!   e. If price keeps rising, `peak_price` is continuously updated.
+//! **Dynamic trailing take-profit tiers** (by entry price):
+//! | Entry Price  | TP activate | Allowed drawdown |
+//! |--------------|-------------|-----------------|
+//! | < 0.40       | 80% profit  | 15% from peak   |
+//! | 0.40–0.55    | 60% profit  | 12% from peak   |
+//! | 0.55–0.70    | 40% profit  | 10% from peak   |
+//! | > 0.70       | 25% profit  | 8% from peak    |
 //!
-//! This lets winners run while locking in gains once a pullback starts.
+//! **Force lines** (never modified):
+//! - Price < 0.15 → immediate exit (prevent going to zero)
+//! - Price > 0.95 → immediate exit (avoid last-minute crash)
+//!
+//! **Special conditions**:
+//! - Market ends < 4h: TP threshold halved, drawdown halved
+//! - Daily volatility > 30%: drawdown +5%
+//! - SL and TP run in parallel, whichever triggers first wins
 
 use crate::clients::OrderSubmitter;
 use crate::config::Config;
@@ -29,19 +41,115 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
+// Price tier parameters
+// ---------------------------------------------------------------------------
+
+/// Per-tier parameters for dynamic SL/TP.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PriceTier {
+    /// Initial stop-loss percentage below entry (e.g. 0.20 = 20%).
+    pub initial_sl_pct: Decimal,
+    /// Profit threshold to activate trailing take-profit (e.g. 0.80 = 80%).
+    pub tp_activate_pct: Decimal,
+    /// Allowed drawdown from peak after TP activation (e.g. 0.15 = 15%).
+    pub tp_drawdown_pct: Decimal,
+}
+
+/// Select the price tier based on entry price.
+fn get_tier(entry_price: Decimal) -> PriceTier {
+    if entry_price < dec!(0.40) {
+        PriceTier {
+            initial_sl_pct: dec!(0.20),
+            tp_activate_pct: dec!(0.80),
+            tp_drawdown_pct: dec!(0.15),
+        }
+    } else if entry_price < dec!(0.55) {
+        PriceTier {
+            initial_sl_pct: dec!(0.15),
+            tp_activate_pct: dec!(0.60),
+            tp_drawdown_pct: dec!(0.12),
+        }
+    } else if entry_price < dec!(0.70) {
+        PriceTier {
+            initial_sl_pct: dec!(0.12),
+            tp_activate_pct: dec!(0.40),
+            tp_drawdown_pct: dec!(0.10),
+        }
+    } else {
+        PriceTier {
+            initial_sl_pct: dec!(0.10),
+            tp_activate_pct: dec!(0.25),
+            tp_drawdown_pct: dec!(0.08),
+        }
+    }
+}
+
+/// Stop-loss status label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlStatus {
+    /// Initial stop-loss from entry price tier.
+    Initial,
+    /// Moved to breakeven (profit ≥ 20%).
+    Breakeven,
+    /// Locked 20% profit (profit ≥ 50%).
+    LockProfit,
+}
+
+impl std::fmt::Display for SlStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlStatus::Initial => write!(f, "初始止损"),
+            SlStatus::Breakeven => write!(f, "保本止损"),
+            SlStatus::LockProfit => write!(f, "锁利止损"),
+        }
+    }
+}
+
+/// Close reason for logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    InitialSl,
+    BreakevenSl,
+    LockProfitSl,
+    ForceStop,
+    TrailingTp,
+    ForceClose,
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CloseReason::InitialSl => write!(f, "初始止损"),
+            CloseReason::BreakevenSl => write!(f, "保本止损"),
+            CloseReason::LockProfitSl => write!(f, "锁利止损"),
+            CloseReason::ForceStop => write!(f, "强制止损"),
+            CloseReason::TrailingTp => write!(f, "回撤止盈"),
+            CloseReason::ForceClose => write!(f, "强制止盈"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tracked position
 // ---------------------------------------------------------------------------
 
-/// Per-position stop-loss / trailing take-profit record.
+/// Per-position dynamic tiered stop-loss / trailing take-profit record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedPosition {
     pub token_id: String,
     pub entry_price: Decimal,
-    pub stop_loss_price: Decimal,
-    /// Target profit % to activate trailing (e.g. 0.35 = 35%).
-    pub take_profit_pct: Decimal,
-    /// Allowed drawdown from peak after activation (e.g. 0.10 = 10%).
-    pub take_profit_drawdown_pct: Decimal,
+    /// Current stop-loss price (moves up as profit grows).
+    pub current_sl_price: Decimal,
+    /// Current SL status label.
+    pub sl_status: SlStatus,
+    /// Price tier parameters (frozen at entry time).
+    pub tier: PriceTier,
+    /// Effective TP activate threshold (may be halved near expiry).
+    pub effective_tp_activate_pct: Decimal,
+    /// Effective drawdown allowed (may be halved near expiry or boosted by volatility).
+    pub effective_drawdown_pct: Decimal,
     /// Whether trailing take-profit has been activated.
     pub trailing_activated: bool,
     /// Highest price seen since trailing activation (None until activated).
@@ -53,9 +161,12 @@ pub struct TrackedPosition {
 pub struct TrackedPositionStatus {
     pub token_id: String,
     pub entry_price: Decimal,
-    pub stop_loss_price: Decimal,
+    pub current_sl_price: Decimal,
+    pub sl_status: SlStatus,
     pub trailing_activated: bool,
     pub peak_price: Option<Decimal>,
+    /// The price at which trailing TP would be activated.
+    pub tp_activate_price: Decimal,
     /// Distance from peak to drawdown threshold (remaining % before TP triggers).
     pub drawdown_remaining_pct: Option<Decimal>,
 }
@@ -68,12 +179,10 @@ pub struct TrackedPositionStatus {
 pub struct StopLossState {
     /// Enabled flag — read from config.
     pub enabled: bool,
-    /// Stop-loss percentage (e.g. 0.10 = 10% below entry).
-    pub stop_loss_pct: Decimal,
-    /// Take-profit target % to activate trailing (e.g. 0.35 = 35% above entry).
-    pub take_profit_pct: Decimal,
-    /// Allowed drawdown from peak after trailing activation (e.g. 0.10 = 10%).
-    pub take_profit_drawdown_pct: Decimal,
+    /// Force stop-loss price — below this, always exit (e.g. 0.15).
+    pub force_stop_price: Decimal,
+    /// Force take-profit price — above this, always exit (e.g. 0.95).
+    pub force_close_price: Decimal,
     /// Check interval in seconds.
     pub check_interval_secs: u64,
     /// Tracked positions keyed by token_id.
@@ -83,16 +192,14 @@ pub struct StopLossState {
 impl StopLossState {
     pub fn new(
         enabled: bool,
-        stop_loss_pct: Decimal,
-        take_profit_pct: Decimal,
-        take_profit_drawdown_pct: Decimal,
+        force_stop_price: Decimal,
+        force_close_price: Decimal,
         check_interval_secs: u64,
     ) -> Self {
         Self {
             enabled,
-            stop_loss_pct,
-            take_profit_pct,
-            take_profit_drawdown_pct,
+            force_stop_price,
+            force_close_price,
             check_interval_secs,
             positions: HashMap::new(),
         }
@@ -100,25 +207,36 @@ impl StopLossState {
 
     /// Record a new entry so the monitor can watch it.
     pub fn record_entry(&mut self, token_id: String, entry_price: Decimal) {
-        let stop_loss_price = entry_price * (Decimal::ONE - self.stop_loss_pct);
-        let take_profit_activate_price = entry_price * (Decimal::ONE + self.take_profit_pct);
+        let tier = get_tier(entry_price);
+        let current_sl_price = entry_price * (Decimal::ONE - tier.initial_sl_pct);
+        let tp_activate_price = entry_price * (Decimal::ONE + tier.tp_activate_pct);
+
         let tracked = TrackedPosition {
             token_id: token_id.clone(),
             entry_price,
-            stop_loss_price,
-            take_profit_pct: self.take_profit_pct,
-            take_profit_drawdown_pct: self.take_profit_drawdown_pct,
+            current_sl_price,
+            sl_status: SlStatus::Initial,
+            tier,
+            effective_tp_activate_pct: tier.tp_activate_pct,
+            effective_drawdown_pct: tier.tp_drawdown_pct,
             trailing_activated: false,
             peak_price: None,
         };
+
         info!(
-            "[STOP-LOSS] Tracking token {}: entry={}, stop_loss={}, trailing_tp_activate_at={}, drawdown_pct={}",
+            "[SL/TP] Tracking token {}: entry={:.3}, sl={:.3} ({}, {}), tp_activate_at={:.3} ({}%), drawdown={}% | force_stop={:.2}, force_close={:.2}",
             &token_id[..token_id.len().min(12)],
             entry_price,
-            stop_loss_price,
-            take_profit_activate_price,
-            self.take_profit_drawdown_pct
+            current_sl_price,
+            tracked.sl_status,
+            format_pct(tier.initial_sl_pct),
+            tp_activate_price,
+            format_pct(tier.tp_activate_pct),
+            format_pct(tier.tp_drawdown_pct),
+            self.force_stop_price,
+            self.force_close_price,
         );
+
         self.positions.insert(token_id, tracked);
     }
 
@@ -136,11 +254,14 @@ impl StopLossState {
             .values()
             .map(|tp| {
                 let cur_price = current_prices.get(&tp.token_id).copied();
+                let tp_activate_price =
+                    tp.entry_price * (Decimal::ONE + tp.effective_tp_activate_pct);
+
                 let drawdown_remaining_pct = if tp.trailing_activated {
                     if let (Some(peak), Some(cur)) = (tp.peak_price, cur_price) {
                         if peak > Decimal::ZERO {
                             let current_drawdown = (peak - cur) / peak;
-                            Some(tp.take_profit_drawdown_pct - current_drawdown)
+                            Some(tp.effective_drawdown_pct - current_drawdown)
                         } else {
                             None
                         }
@@ -150,12 +271,15 @@ impl StopLossState {
                 } else {
                     None
                 };
+
                 TrackedPositionStatus {
                     token_id: tp.token_id.clone(),
                     entry_price: tp.entry_price,
-                    stop_loss_price: tp.stop_loss_price,
+                    current_sl_price: tp.current_sl_price,
+                    sl_status: tp.sl_status,
                     trailing_activated: tp.trailing_activated,
                     peak_price: tp.peak_price,
+                    tp_activate_price,
                     drawdown_remaining_pct,
                 }
             })
@@ -163,14 +287,16 @@ impl StopLossState {
     }
 }
 
+/// Format a Decimal fraction as percentage string (e.g. 0.15 → "15.0").
+fn format_pct(v: Decimal) -> String {
+    (v * dec!(100)).to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Monitor background task
 // ---------------------------------------------------------------------------
 
-/// Start the stop-loss / trailing take-profit monitor.
-///
-/// This spawns a background tokio task that wakes every
-/// `check_interval_secs` seconds and checks all tracked positions.
+/// Start the dynamic tiered stop-loss / trailing take-profit monitor.
 pub fn start_stop_loss_monitor(
     state: Arc<RwLock<BotState>>,
     sl_state: Arc<Mutex<StopLossState>>,
@@ -181,23 +307,30 @@ pub fn start_stop_loss_monitor(
     {
         let guard = sl_state.blocking_lock();
         if !guard.enabled {
-            info!("[STOP-LOSS] Disabled in config — monitor not started.");
+            info!("[SL/TP] Disabled in config — monitor not started.");
             return;
         }
     }
 
     tokio::spawn(async move {
-        let check_interval = {
+        let (check_interval, force_stop, force_close) = {
             let guard = sl_state.lock().await;
-            tokio::time::Duration::from_secs(guard.check_interval_secs.max(1))
+            (
+                tokio::time::Duration::from_secs(guard.check_interval_secs.max(1)),
+                guard.force_stop_price,
+                guard.force_close_price,
+            )
         };
 
         info!(
-            "[STOP-LOSS] Monitor started (checking every {}s).",
-            check_interval.as_secs()
+            "[SL/TP] Monitor started (checking every {}s, force_stop={:.2}, force_close={:.2}).",
+            check_interval.as_secs(),
+            force_stop,
+            force_close
         );
 
         let mut interval = tokio::time::interval(check_interval);
+        let mut prev_prices: HashMap<String, Decimal> = HashMap::new();
 
         loop {
             interval.tick().await;
@@ -211,13 +344,17 @@ pub fn start_stop_loss_monitor(
                 guard.positions.values().cloned().collect()
             };
 
-            // Get current prices from BotState — uses cur_price from Polymarket official API
-            // (populated by wallet_sync position sync task)
-            let current_prices: HashMap<String, Decimal> = {
+            // Get current prices + end dates from BotState
+            // cur_price comes from Polymarket official API via wallet_sync
+            #[allow(clippy::type_complexity)]
+            let (current_prices, end_dates): (
+                HashMap<String, Decimal>,
+                HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
+            ) = {
                 let bot = state.read().await;
                 let mut prices = HashMap::new();
+                let mut ends = HashMap::new();
                 for token_id in bot.positions.keys() {
-                    // Use target_positions to find current price if available
                     if let Some(tp) = bot
                         .target_positions
                         .iter()
@@ -226,130 +363,220 @@ pub fn start_stop_loss_monitor(
                         prices.insert(token_id.clone(), tp.cur_price);
                     }
                 }
-                prices
+                // Get end_dates from pending_orders (which carry event_end_date)
+                for (tid, pending) in &bot.pending_orders {
+                    if !prices.contains_key(tid) {
+                        prices.insert(tid.clone(), pending.price);
+                    }
+                    ends.insert(tid.clone(), pending.event_end_date);
+                }
+                (prices, ends)
             };
 
             for mut tracked_pos in tracked {
                 let cur_price = match current_prices.get(&tracked_pos.token_id) {
                     Some(&p) => p,
-                    None => continue, // no price data available yet
+                    None => continue,
                 };
 
-                // ── Check stop-loss (always active) ──────────────────────────
-                if cur_price <= tracked_pos.stop_loss_price {
-                    let loss_pct = if tracked_pos.entry_price > Decimal::ZERO {
-                        ((tracked_pos.entry_price - cur_price) / tracked_pos.entry_price)
-                            * dec!(100)
-                    } else {
-                        Decimal::ZERO
-                    };
-                    warn!(
-                        "[STOP-LOSS] STOP-LOSS triggered for token {}! entry={}, cur={}, loss={:.1}%, sl_price={}",
-                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
-                        tracked_pos.entry_price,
-                        cur_price,
-                        loss_pct,
-                        tracked_pos.stop_loss_price
-                    );
+                // ── Special condition: near-expiry adjustments ────────────────
+                let near_expiry = end_dates
+                    .get(&tracked_pos.token_id)
+                    .and_then(|ed| ed.as_ref())
+                    .map(|ed| {
+                        let now = chrono::Utc::now();
+                        (*ed - now).num_hours() < 4
+                    })
+                    .unwrap_or(false);
 
-                    // Get held size
-                    let held_size = {
-                        let bot = state.read().await;
-                        bot.positions
-                            .get(&tracked_pos.token_id)
-                            .map(|p| p.size)
-                            .unwrap_or(Decimal::ZERO)
-                    };
+                if near_expiry && !tracked_pos.trailing_activated {
+                    // Halve TP threshold and drawdown when market ends < 4h
+                    tracked_pos.effective_tp_activate_pct =
+                        tracked_pos.tier.tp_activate_pct / dec!(2);
+                    tracked_pos.effective_drawdown_pct = tracked_pos.tier.tp_drawdown_pct / dec!(2);
+                    let mut guard = sl_state.lock().await;
+                    if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                        pos.effective_tp_activate_pct = tracked_pos.effective_tp_activate_pct;
+                        pos.effective_drawdown_pct = tracked_pos.effective_drawdown_pct;
+                    }
+                }
 
-                    if held_size > Decimal::ZERO {
-                        // Market sell via Polymarket SDK — price 0.99 ensures fill
-                        let sell_price = Decimal::from_str("0.99").unwrap_or(dec!(0.99));
-                        let order = OrderRequest {
-                            token_id: tracked_pos.token_id.clone(),
-                            price: sell_price,
-                            size: held_size,
-                            side: TradeSide::SELL,
-                        };
-
-                        match submitter.clone()(order).await {
-                            Ok(()) => {
-                                info!(
-                                    "[STOP-LOSS] Successfully closed token {} via stop-loss at price {}",
-                                    &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
-                                    cur_price
-                                );
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[STOP-LOSS] Failed to close token {}: {}",
-                                    &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
-                                    e
-                                );
+                // ── Special condition: high volatility boost ──────────────────
+                let prev = prev_prices.get(&tracked_pos.token_id).copied();
+                if let Some(prev_p) = prev {
+                    if prev_p > Decimal::ZERO {
+                        let daily_move = ((cur_price - prev_p) / prev_p).abs();
+                        if daily_move > dec!(0.30) {
+                            tracked_pos.effective_drawdown_pct =
+                                tracked_pos.tier.tp_drawdown_pct + dec!(0.05);
+                            let mut guard = sl_state.lock().await;
+                            if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                                pos.effective_drawdown_pct = tracked_pos.effective_drawdown_pct;
                             }
                         }
                     }
+                }
+                prev_prices.insert(tracked_pos.token_id.clone(), cur_price);
 
-                    // Remove from tracking regardless
-                    {
-                        let mut guard = sl_state.lock().await;
-                        guard.remove(&tracked_pos.token_id);
-                    }
+                // ── Force stop: price < force_stop_price ─────────────────────
+                if cur_price < force_stop {
+                    warn!(
+                        "[SL/TP] FORCE STOP triggered for token {}! cur={:.3} < force_stop={:.2}",
+                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
+                        cur_price,
+                        force_stop
+                    );
+                    close_position(
+                        &tracked_pos.token_id,
+                        &state,
+                        &submitter,
+                        CloseReason::ForceStop,
+                        cur_price,
+                    )
+                    .await;
+                    sl_state.lock().await.remove(&tracked_pos.token_id);
                     continue;
                 }
 
-                // ── Check trailing take-profit ──────────────────────────────
+                // ── Force close: price > force_close_price ───────────────────
+                if cur_price > force_close {
+                    warn!(
+                        "[SL/TP] FORCE CLOSE triggered for token {}! cur={:.3} > force_close={:.2}",
+                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
+                        cur_price,
+                        force_close
+                    );
+                    close_position(
+                        &tracked_pos.token_id,
+                        &state,
+                        &submitter,
+                        CloseReason::ForceClose,
+                        cur_price,
+                    )
+                    .await;
+                    sl_state.lock().await.remove(&tracked_pos.token_id);
+                    continue;
+                }
+
+                // ── Update stop-loss tier (breakeven / lock-profit) ──────────
                 let profit_pct = if tracked_pos.entry_price > Decimal::ZERO {
                     (cur_price - tracked_pos.entry_price) / tracked_pos.entry_price
                 } else {
                     Decimal::ZERO
                 };
 
+                let new_sl_price;
+                let new_sl_status;
+
+                if profit_pct >= dec!(0.50) {
+                    // Lock 20% profit: SL = entry × 1.2
+                    new_sl_price = tracked_pos.entry_price * dec!(1.2);
+                    new_sl_status = SlStatus::LockProfit;
+                } else if profit_pct >= dec!(0.20) {
+                    // Breakeven: SL = entry price
+                    new_sl_price = tracked_pos.entry_price;
+                    new_sl_status = SlStatus::Breakeven;
+                } else {
+                    new_sl_price = tracked_pos.current_sl_price;
+                    new_sl_status = tracked_pos.sl_status;
+                };
+
+                // Only log if SL status changed
+                if new_sl_status != tracked_pos.sl_status {
+                    info!(
+                        "[SL/TP] SL adjusted for token {}: {} → {} | sl_price={:.3} → {:.3} | entry={:.3} | profit={:.1}%",
+                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
+                        tracked_pos.sl_status,
+                        new_sl_status,
+                        tracked_pos.current_sl_price,
+                        new_sl_price,
+                        tracked_pos.entry_price,
+                        profit_pct * dec!(100)
+                    );
+                    tracked_pos.sl_status = new_sl_status;
+                    tracked_pos.current_sl_price = new_sl_price;
+                    let mut guard = sl_state.lock().await;
+                    if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                        pos.sl_status = new_sl_status;
+                        pos.current_sl_price = new_sl_price;
+                    }
+                }
+
+                // ── Check stop-loss ──────────────────────────────────────────
+                if cur_price <= tracked_pos.current_sl_price {
+                    let loss_pct = if tracked_pos.entry_price > Decimal::ZERO {
+                        ((tracked_pos.entry_price - cur_price) / tracked_pos.entry_price)
+                            * dec!(100)
+                    } else {
+                        Decimal::ZERO
+                    };
+                    let close_reason = match tracked_pos.sl_status {
+                        SlStatus::Initial => CloseReason::InitialSl,
+                        SlStatus::Breakeven => CloseReason::BreakevenSl,
+                        SlStatus::LockProfit => CloseReason::LockProfitSl,
+                    };
+                    warn!(
+                        "[SL/TP] {} triggered for token {}! entry={:.3}, cur={:.3}, sl_price={:.3}, loss={:.1}%",
+                        close_reason,
+                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
+                        tracked_pos.entry_price,
+                        cur_price,
+                        tracked_pos.current_sl_price,
+                        loss_pct
+                    );
+                    close_position(
+                        &tracked_pos.token_id,
+                        &state,
+                        &submitter,
+                        close_reason,
+                        cur_price,
+                    )
+                    .await;
+                    sl_state.lock().await.remove(&tracked_pos.token_id);
+                    continue;
+                }
+
+                // ── Check trailing take-profit ───────────────────────────────
                 if !tracked_pos.trailing_activated {
-                    // Step a: Check if profit has reached the activation threshold
-                    if profit_pct >= tracked_pos.take_profit_pct {
+                    if profit_pct >= tracked_pos.effective_tp_activate_pct {
                         tracked_pos.trailing_activated = true;
                         tracked_pos.peak_price = Some(cur_price);
                         info!(
-                            "[STOP-LOSS] Trailing TP ACTIVATED for token {}! activate_price={}, peak={}, entry={}",
+                            "[SL/TP] Trailing TP ACTIVATED for token {}! activate_price={:.3}, peak={:.3}, entry={:.3}, drawdown={}%{}",
                             &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
                             cur_price,
                             cur_price,
-                            tracked_pos.entry_price
+                            tracked_pos.entry_price,
+                            format_pct(tracked_pos.effective_drawdown_pct),
+                            if near_expiry { " (near-expiry halved)" } else { "" }
                         );
-                        // Update the tracked position in shared state
-                        {
-                            let mut guard = sl_state.lock().await;
-                            if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
-                                pos.trailing_activated = true;
-                                pos.peak_price = Some(cur_price);
-                            }
+                        let mut guard = sl_state.lock().await;
+                        if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                            pos.trailing_activated = true;
+                            pos.peak_price = Some(cur_price);
                         }
                     }
                 } else {
-                    // Trailing is active — update peak and check drawdown
+                    // Trailing active — update peak and check drawdown
                     let mut should_sell = false;
                     let mut drawdown_pct = Decimal::ZERO;
 
                     if let Some(peak) = tracked_pos.peak_price {
                         if cur_price > peak {
-                            // New peak — update
                             info!(
-                                "[STOP-LOSS] Trailing TP peak updated for token {}: old_peak={} → new_peak={}",
+                                "[SL/TP] Peak updated for token {}: old={:.3} → new={:.3}",
                                 &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
                                 peak,
                                 cur_price
                             );
                             tracked_pos.peak_price = Some(cur_price);
-                            {
-                                let mut guard = sl_state.lock().await;
-                                if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
-                                    pos.peak_price = Some(cur_price);
-                                }
+                            let mut guard = sl_state.lock().await;
+                            if let Some(pos) = guard.positions.get_mut(&tracked_pos.token_id) {
+                                pos.peak_price = Some(cur_price);
                             }
                         } else if peak > Decimal::ZERO {
-                            // Check drawdown from peak
                             drawdown_pct = (peak - cur_price) / peak;
-                            if drawdown_pct >= tracked_pos.take_profit_drawdown_pct {
+                            if drawdown_pct >= tracked_pos.effective_drawdown_pct {
                                 should_sell = true;
                             }
                         }
@@ -357,55 +584,24 @@ pub fn start_stop_loss_monitor(
 
                     if should_sell {
                         warn!(
-                            "[STOP-LOSS] Trailing TP TRIGGERED for token {}! peak={}, cur={}, drawdown={:.1}%, threshold={:.1}%, exit_price={}",
+                            "[SL/TP] Trailing TP TRIGGERED for token {}! peak={:.3}, cur={:.3}, drawdown={:.1}%, threshold={:.1}%{} | exit_price={:.3}",
                             &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
                             tracked_pos.peak_price.unwrap_or(Decimal::ZERO),
                             cur_price,
                             drawdown_pct * dec!(100),
-                            tracked_pos.take_profit_drawdown_pct * dec!(100),
+                            tracked_pos.effective_drawdown_pct * dec!(100),
+                            if near_expiry { " (near-expiry)" } else { "" },
                             cur_price
                         );
-
-                        let held_size = {
-                            let bot = state.read().await;
-                            bot.positions
-                                .get(&tracked_pos.token_id)
-                                .map(|p| p.size)
-                                .unwrap_or(Decimal::ZERO)
-                        };
-
-                        if held_size > Decimal::ZERO {
-                            // Market sell via Polymarket SDK
-                            let sell_price = Decimal::from_str("0.99").unwrap_or(dec!(0.99));
-                            let order = OrderRequest {
-                                token_id: tracked_pos.token_id.clone(),
-                                price: sell_price,
-                                size: held_size,
-                                side: TradeSide::SELL,
-                            };
-
-                            match submitter.clone()(order).await {
-                                Ok(()) => {
-                                    info!(
-                                        "[STOP-LOSS] Successfully closed token {} via trailing take-profit at price {}",
-                                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
-                                        cur_price
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "[STOP-LOSS] Failed to close token {}: {}",
-                                        &tracked_pos.token_id[..tracked_pos.token_id.len().min(12)],
-                                        e
-                                    );
-                                }
-                            }
-                        }
-
-                        {
-                            let mut guard = sl_state.lock().await;
-                            guard.remove(&tracked_pos.token_id);
-                        }
+                        close_position(
+                            &tracked_pos.token_id,
+                            &state,
+                            &submitter,
+                            CloseReason::TrailingTp,
+                            cur_price,
+                        )
+                        .await;
+                        sl_state.lock().await.remove(&tracked_pos.token_id);
                         continue;
                     }
                 }
@@ -421,4 +617,55 @@ pub fn start_stop_loss_monitor(
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Helper: close a position via market sell
+// ---------------------------------------------------------------------------
+
+async fn close_position(
+    token_id: &str,
+    state: &Arc<RwLock<BotState>>,
+    submitter: &OrderSubmitter,
+    reason: CloseReason,
+    exit_price: Decimal,
+) {
+    let held_size = {
+        let bot = state.read().await;
+        bot.positions
+            .get(token_id)
+            .map(|p| p.size)
+            .unwrap_or(Decimal::ZERO)
+    };
+
+    if held_size <= Decimal::ZERO {
+        return;
+    }
+
+    // Market sell via Polymarket SDK — price 0.99 ensures fill
+    let sell_price = Decimal::from_str("0.99").unwrap_or(dec!(0.99));
+    let order = OrderRequest {
+        token_id: token_id.to_string(),
+        price: sell_price,
+        size: held_size,
+        side: TradeSide::SELL,
+    };
+
+    match submitter.clone()(order).await {
+        Ok(()) => {
+            info!(
+                "[SL/TP] Closed token {} via {} at price {:.3}",
+                &token_id[..token_id.len().min(12)],
+                reason,
+                exit_price
+            );
+        }
+        Err(e) => {
+            error!(
+                "[SL/TP] Failed to close token {}: {}",
+                &token_id[..token_id.len().min(12)],
+                e
+            );
+        }
+    }
 }

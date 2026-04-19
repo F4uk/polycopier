@@ -220,9 +220,8 @@ async fn main() -> anyhow::Result<()> {
     // Stop-loss / take-profit state — initialized from config before strategy engine starts.
     let sl_state = Arc::new(Mutex::new(stop_loss::StopLossState::new(
         config.stop_loss_enabled,
-        config.stop_loss_pct,
-        config.take_profit_pct,
-        config.take_profit_drawdown_pct,
+        config.force_stop_price,
+        config.force_close_price,
         config.stop_loss_check_interval_secs,
     )));
 

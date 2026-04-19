@@ -27,9 +27,11 @@ interface PerfMetrics {
 interface TrackedPositionStatus {
   token_id: string;
   entry_price: string;
-  stop_loss_price: string;
+  current_sl_price: string;
+  sl_status: 'initial' | 'breakeven' | 'lock_profit';
   trailing_activated: boolean;
   peak_price: string | null;
+  tp_activate_price: string;
   drawdown_remaining_pct: string | null;
 }
 
@@ -312,11 +314,12 @@ export default function AiPanel({
             <thead>
               <tr>
                 <th>Token</th>
-                <th>Entry Price</th>
-                <th>Stop Loss</th>
-                <th>Status</th>
-                <th>Peak Price</th>
-                <th>Drawdown Remaining</th>
+                <th>Entry</th>
+                <th>止损价</th>
+                <th>止损状态</th>
+                <th>止盈触发价</th>
+                <th>历史最高</th>
+                <th>距回撤止盈</th>
               </tr>
             </thead>
             <tbody>
@@ -324,38 +327,30 @@ export default function AiPanel({
                 const remaining = pos.drawdown_remaining_pct ? parseFloat(pos.drawdown_remaining_pct) : null;
                 const remainingPct = remaining !== null ? (remaining * 100).toFixed(1) : '—';
                 const isLow = remaining !== null && remaining < 0.03;
+                const slLabel = pos.sl_status === 'initial' ? '初始止损'
+                  : pos.sl_status === 'breakeven' ? '保本止损' : '锁利止损';
+                const slColor = pos.sl_status === 'initial' ? 'var(--text-secondary)'
+                  : pos.sl_status === 'breakeven' ? '#fbbf24' : '#4ade80';
                 return (
                   <tr key={pos.token_id}>
                     <td style={{ fontFamily: 'monospace', fontSize: '0.8rem' }} title={pos.token_id}>
                       {pos.token_id.substring(0, 12)}...
                     </td>
                     <td>${parseFloat(pos.entry_price).toFixed(3)}</td>
-                    <td className="val-negative">${parseFloat(pos.stop_loss_price).toFixed(3)}</td>
+                    <td className="val-negative">${parseFloat(pos.current_sl_price).toFixed(3)}</td>
                     <td>
-                      {pos.trailing_activated ? (
-                        <span style={{
-                          fontSize: '0.7rem',
-                          padding: '2px 6px',
-                          borderRadius: '3px',
-                          background: 'rgba(74,222,128,0.15)',
-                          border: '1px solid rgba(74,222,128,0.4)',
-                          color: '#4ade80',
-                        }}>
-                          Trailing Active
-                        </span>
-                      ) : (
-                        <span style={{
-                          fontSize: '0.7rem',
-                          padding: '2px 6px',
-                          borderRadius: '3px',
-                          background: 'rgba(255,255,255,0.06)',
-                          border: '1px solid rgba(255,255,255,0.15)',
-                          color: 'var(--text-secondary)',
-                        }}>
-                          Waiting
-                        </span>
-                      )}
+                      <span style={{
+                        fontSize: '0.7rem',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
+                        background: slColor === '#4ade80' ? 'rgba(74,222,128,0.15)' : slColor === '#fbbf24' ? 'rgba(251,191,36,0.15)' : 'rgba(255,255,255,0.06)',
+                        border: `1px solid ${slColor === '#4ade80' ? 'rgba(74,222,128,0.4)' : slColor === '#fbbf24' ? 'rgba(251,191,36,0.4)' : 'rgba(255,255,255,0.15)'}`,
+                        color: slColor,
+                      }}>
+                        {slLabel}
+                      </span>
                     </td>
+                    <td>${parseFloat(pos.tp_activate_price).toFixed(3)}</td>
                     <td>
                       {pos.peak_price ? `$${parseFloat(pos.peak_price).toFixed(3)}` : '—'}
                     </td>
@@ -367,7 +362,7 @@ export default function AiPanel({
               })}
               {slStatus.length === 0 && (
                 <tr>
-                  <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>
+                  <td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>
                     No positions being tracked. Status will appear after entries are made.
                   </td>
                 </tr>
