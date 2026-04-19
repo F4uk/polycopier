@@ -14,6 +14,7 @@
 use crate::config::BotConfig;
 use crate::models::{EvaluatedTrade, Position, TargetPosition};
 use crate::state::{BotState, PerfMetrics, PnlSnapshot, WalletStats};
+use crate::stop_loss::StopLossState;
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,8 @@ pub struct ApiState {
             + Send
             + Sync,
     >,
+    /// Stop-loss / take-profit tracked positions state.
+    pub sl_state: Arc<Mutex<StopLossState>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +154,8 @@ pub struct StateResponse {
     pub pnl_history: Vec<PnlSnapshot>,
     /// Whether running in simulation mode.
     pub is_sim: bool,
+    /// Stop-loss / take-profit tracked positions status.
+    pub sl_status: Vec<crate::stop_loss::TrackedPositionStatus>,
 }
 
 async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
@@ -218,6 +223,16 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
         perf: guard.perf.clone(),
         pnl_history: guard.pnl_history.clone(),
         is_sim: false, // will be overridden by caller if needed
+        sl_status: {
+            let sl_guard = api_state.sl_state.lock().await;
+            sl_guard.get_all_status(&{
+                let mut prices = HashMap::new();
+                for tp in &guard.target_positions {
+                    prices.insert(tp.token_id.clone(), tp.cur_price);
+                }
+                prices
+            })
+        },
     })
 }
 
@@ -635,6 +650,33 @@ async fn get_csv_export(State(api_state): State<ApiState>) -> impl IntoResponse 
 }
 
 // ---------------------------------------------------------------------------
+// Stop-loss / take-profit tracked positions status
+// ---------------------------------------------------------------------------
+
+async fn get_sl_status(
+    State(api_state): State<ApiState>,
+) -> Json<Vec<crate::stop_loss::TrackedPositionStatus>> {
+    // Get current prices from BotState
+    let current_prices: HashMap<String, Decimal> = {
+        let bot = api_state.bot_state.read().await;
+        let mut prices = HashMap::new();
+        for token_id in bot.positions.keys() {
+            if let Some(tp) = bot
+                .target_positions
+                .iter()
+                .find(|tp| &tp.token_id == token_id)
+            {
+                prices.insert(token_id.clone(), tp.cur_price);
+            }
+        }
+        prices
+    };
+
+    let guard = api_state.sl_state.lock().await;
+    Json(guard.get_all_status(&current_prices))
+}
+
+// ---------------------------------------------------------------------------
 // PnL history endpoint
 // ---------------------------------------------------------------------------
 
@@ -721,6 +763,7 @@ pub fn create_router(
             + Send
             + Sync,
     >,
+    sl_state: Arc<Mutex<StopLossState>>,
 ) -> Router {
     use tower_http::cors::{Any, CorsLayer};
     use tower_http::services::{ServeDir, ServeFile};
@@ -734,6 +777,7 @@ pub fn create_router(
         bot_state,
         copy_ledger,
         submitter,
+        sl_state,
     };
 
     let root_path = std::env::current_dir().unwrap().join("web/dist");
@@ -760,6 +804,8 @@ pub fn create_router(
         .route("/api/pnl/history", get(get_pnl_history))
         // Wallet blacklist
         .route("/api/wallet/blacklist", post(post_wallet_blacklist))
+        // Stop-loss / take-profit status
+        .route("/api/sl/status", get(get_sl_status))
         // CSV export
         .route("/api/csv/export", get(get_csv_export))
         .with_state(state)

@@ -222,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         config.stop_loss_enabled,
         config.stop_loss_pct,
         config.take_profit_pct,
+        config.take_profit_drawdown_pct,
         config.stop_loss_check_interval_secs,
     )));
 
@@ -329,7 +330,12 @@ async fn main() -> anyhow::Result<()> {
     // ── Local Web API Server ──────────────────────────────────────────────────
     // AI endpoints (/ai/close, /ai/freeze), AI stats (/api/ai/stats),
     // and market mute (/api/ai/markets) all run on the same port 3000.
-    let api_router = api::create_router(state.clone(), copy_ledger.clone(), submitter_for_api);
+    let api_router = api::create_router(
+        state.clone(),
+        copy_ledger.clone(),
+        submitter_for_api,
+        sl_state.clone(),
+    );
 
     // ── Stop-loss / take-profit monitor ──────────────────────────────────────
     stop_loss::start_stop_loss_monitor(

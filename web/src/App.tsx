@@ -178,6 +178,7 @@ function App() {
           todayRealizedLoss={state.today_realized_loss || '0'}
           dailyStartBalance={state.daily_start_balance || '0'}
           dailyLossTriggered={state.daily_loss_triggered || false}
+          slStatus={state.sl_status || []}
         />
       ) : activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>

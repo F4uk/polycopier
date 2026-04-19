@@ -56,3 +56,15 @@ loss_cooldown_secs = 300
 [ledger]
 # Days to retain closed trade ledger entries. 0 = never prune.
 retention_days = 90
+
+[stop_loss]
+# Enable local stop-loss / take-profit monitoring
+enabled = true
+# Fixed stop-loss percentage (0.10 = 10%)
+stop_loss_pct = 0.10
+# Target profit percentage — triggers trailing take-profit (0.35 = 35%)
+take_profit_pct = 0.35
+# Allowed drawdown from peak after trailing TP activation (0.10 = 10%)
+take_profit_drawdown_pct = 0.10
+# Check interval (seconds)
+check_interval_secs = 3

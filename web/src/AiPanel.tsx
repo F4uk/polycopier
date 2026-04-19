@@ -24,6 +24,15 @@ interface PerfMetrics {
   avg_copy_latency_ms: number;
 }
 
+interface TrackedPositionStatus {
+  token_id: string;
+  entry_price: string;
+  stop_loss_price: string;
+  trailing_activated: boolean;
+  peak_price: string | null;
+  drawdown_remaining_pct: string | null;
+}
+
 interface AiPanelProps {
   walletStats: Record<string, WalletStats>;
   mutedMarkets: string[];
@@ -39,6 +48,7 @@ interface AiPanelProps {
   todayRealizedLoss: string;
   dailyStartBalance: string;
   dailyLossTriggered: boolean;
+  slStatus: TrackedPositionStatus[];
 }
 
 export default function AiPanel({
@@ -56,6 +66,7 @@ export default function AiPanel({
   todayRealizedLoss,
   dailyStartBalance,
   dailyLossTriggered,
+  slStatus,
 }: AiPanelProps) {
   const [muteInput, setMuteInput] = useState('');
   const [muteMsg, setMuteMsg] = useState('');
@@ -285,6 +296,84 @@ export default function AiPanel({
             <span className="stat-label">API Calls Today</span>
             <span className="stat-value">{perf.today_api_calls}</span>
           </div>
+        </div>
+      </div>
+
+      {/* Stop-Loss / Take-Profit Status */}
+      <div className="glass-panel">
+        <div className="panel-header">
+          Stop-Loss / Take-Profit Status
+          <span className="panel-subtitle">
+            Tracking: {slStatus.length} position{slStatus.length !== 1 ? 's' : ''}
+          </span>
+        </div>
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>Entry Price</th>
+                <th>Stop Loss</th>
+                <th>Status</th>
+                <th>Peak Price</th>
+                <th>Drawdown Remaining</th>
+              </tr>
+            </thead>
+            <tbody>
+              {slStatus.map((pos) => {
+                const remaining = pos.drawdown_remaining_pct ? parseFloat(pos.drawdown_remaining_pct) : null;
+                const remainingPct = remaining !== null ? (remaining * 100).toFixed(1) : '—';
+                const isLow = remaining !== null && remaining < 0.03;
+                return (
+                  <tr key={pos.token_id}>
+                    <td style={{ fontFamily: 'monospace', fontSize: '0.8rem' }} title={pos.token_id}>
+                      {pos.token_id.substring(0, 12)}...
+                    </td>
+                    <td>${parseFloat(pos.entry_price).toFixed(3)}</td>
+                    <td className="val-negative">${parseFloat(pos.stop_loss_price).toFixed(3)}</td>
+                    <td>
+                      {pos.trailing_activated ? (
+                        <span style={{
+                          fontSize: '0.7rem',
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          background: 'rgba(74,222,128,0.15)',
+                          border: '1px solid rgba(74,222,128,0.4)',
+                          color: '#4ade80',
+                        }}>
+                          Trailing Active
+                        </span>
+                      ) : (
+                        <span style={{
+                          fontSize: '0.7rem',
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          background: 'rgba(255,255,255,0.06)',
+                          border: '1px solid rgba(255,255,255,0.15)',
+                          color: 'var(--text-secondary)',
+                        }}>
+                          Waiting
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {pos.peak_price ? `$${parseFloat(pos.peak_price).toFixed(3)}` : '—'}
+                    </td>
+                    <td className={isLow ? 'val-negative' : remaining !== null && remaining > 0.05 ? 'val-positive' : ''}>
+                      {pos.trailing_activated ? `${remainingPct}%` : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+              {slStatus.length === 0 && (
+                <tr>
+                  <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>
+                    No positions being tracked. Status will appear after entries are made.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
