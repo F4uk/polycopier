@@ -29,5 +29,9 @@ sim_copy_ledger.json
 *.swo
 .DS_Store
 
+# Windows build tool installers — not part of the project
+rustup-init.exe
+vs_BuildTools.exe
+
 # Rust
 .agents/
