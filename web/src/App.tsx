@@ -1,8 +1,29 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Component, ReactNode } from 'react';
 import SettingsManager from './SettingsManager';
 import SetupWizard from './SetupWizard';
 import AiPanel from './AiPanel';
 import PnLChart from './PnLChart';
+
+// ── ErrorBoundary: catches render-time crashes that would otherwise blank-screen ──
+interface EBProps { children: ReactNode }
+interface EBState { hasError: boolean; error: Error | null }
+class ErrorBoundary extends Component<EBProps, EBState> {
+  state: EBState = { hasError: false, error: null };
+  static getDerivedStateFromError(error: Error) { return { hasError: true, error }; }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100vh',gap:'1rem',padding:'2rem',color:'#f87171' }}>
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+          <h2 style={{ fontSize:'1.25rem',fontWeight:600 }}>Rendering Error</h2>
+          <p style={{ color:'#94a3b8',fontSize:'0.875rem',textAlign:'center',maxWidth:'500px' }}>{this.state.error?.message}</p>
+          <button onClick={() => window.location.reload()} style={{ padding:'0.5rem 1.5rem',borderRadius:'8px',background:'#3b82f6',color:'#fff',border:'none',cursor:'pointer',fontWeight:600 }}>Reload Page</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function QuickActionButton({ label, color, onClick }: { label: string; color: string; onClick: () => void }) {
   return (
@@ -29,11 +50,16 @@ function App() {
   const [state, setState] = useState<any>(null);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'settings' | 'ai' | 'pnl'>('dashboard');
   const [setupRequired, setSetupRequired] = useState(false);
+  const [connectionError, setConnectionError] = useState(false);
 
   useEffect(() => {
     const fetchState = async () => {
       try {
         const res = await fetch('/api/state');
+        if (!res.ok) {
+          setConnectionError(true);
+          return;
+        }
         const data = await res.json();
         if (data.status === 'setup_required') {
           setSetupRequired(true);
@@ -41,20 +67,34 @@ function App() {
           setSetupRequired(false);
           setState(data);
         }
+        setConnectionError(false);
       } catch (err) {
         console.error('Failed to fetch state', err);
+        setConnectionError(true);
       }
     };
     
     fetchState();
-    // FIX: increased from 1s to 3s polling interval to reduce backend
-    // pressure. The state doesn't change fast enough to warrant 1s polling.
     const interval = setInterval(fetchState, 3000);
     return () => clearInterval(interval);
   }, []);
 
   if (setupRequired) {
     return <SetupWizard />;
+  }
+
+  if (connectionError && !state) {
+    return (
+      <div className="loading-container">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="1.5">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <div style={{ color: '#f87171', fontWeight: 600 }}>Cannot connect to Polycopier Daemon</div>
+        <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', textAlign: 'center', maxWidth: '400px' }}>
+          Make sure the backend is running (<code style={{ background:'rgba(255,255,255,0.06)',padding:'2px 6px',borderRadius:'4px' }}>cargo run -- --ui</code>). Retrying automatically...
+        </div>
+      </div>
+    );
   }
 
   if (!state) {
@@ -121,7 +161,14 @@ function App() {
         <div className="header-title" style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <h1>Polycopier</h1>
-            <div className="live-badge">LIVE</div>
+            {connectionError ? (
+              <div style={{ background:'rgba(239,68,68,0.2)',color:'#f87171',border:'1px solid rgba(239,68,68,0.3)',padding:'0.25rem 0.75rem',borderRadius:'9999px',fontSize:'0.875rem',fontWeight:600,display:'flex',alignItems:'center',gap:'0.5rem' }}>
+                <span style={{width:'8px',height:'8px',background:'#f87171',borderRadius:'50%',display:'inline-block'}}></span>
+                RECONNECTING
+              </div>
+            ) : (
+              <div className="live-badge">LIVE</div>
+            )}
           </div>
           <div className="nav-tabs">
             <button className={`nav-tab ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>Dashboard</button>
@@ -423,4 +470,10 @@ function App() {
   );
 }
 
-export default App;
+export default function AppWithBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
