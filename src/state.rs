@@ -13,6 +13,8 @@ pub struct WalletStats {
     pub total_pnl: Decimal,
     /// Consecutive losses currently (reset on win).
     pub consecutive_losses: u32,
+    /// Wallet weight/scalar from config (e.g. 0.7 or 1.0). Default 1.0.
+    pub weight: Decimal,
 }
 
 /// Performance metrics tracked in real-time.
@@ -97,6 +99,10 @@ pub struct BotState {
     pub perf: PerfMetrics,
     /// PnL snapshots for equity curve (sampled every 60s).
     pub pnl_history: Vec<PnlSnapshot>,
+    /// Token ownership strategy currently active.
+    pub token_ownership_strategy: String,
+    /// Whether partial close is enabled.
+    pub enable_partial_close: bool,
 }
 
 const MUTED_FILE: &str = "muted_markets.json";
@@ -160,6 +166,8 @@ impl BotState {
                 ..Default::default()
             },
             pnl_history: Vec::new(),
+            token_ownership_strategy: "first_come".to_string(),
+            enable_partial_close: true,
         }
     }
 

@@ -156,6 +156,10 @@ pub struct StateResponse {
     pub is_sim: bool,
     /// Stop-loss / take-profit tracked positions status.
     pub sl_status: Vec<crate::stop_loss::TrackedPositionStatus>,
+    /// Token ownership strategy currently active.
+    pub token_ownership_strategy: String,
+    /// Whether partial close is enabled.
+    pub enable_partial_close: bool,
 }
 
 async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
@@ -233,6 +237,8 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
                 prices
             })
         },
+        token_ownership_strategy: guard.token_ownership_strategy.clone(),
+        enable_partial_close: guard.enable_partial_close,
     })
 }
 

@@ -66,3 +66,17 @@ force_stop_price = 0.15
 force_close_price = 0.95
 # Check interval (seconds)
 check_interval_secs = 3
+
+[trading]
+# Token ownership strategy: first_come | win_rate_priority | multi_wallet_average | whitelist_only
+#   first_come         -- first wallet to BUY owns the token (original behavior)
+#   win_rate_priority  -- highest win-rate wallet owns the token
+#   multi_wallet_average -- average across all wallets holding the token
+#   whitelist_only     -- only copy from whitelisted wallets (wallets with :weight suffix)
+token_ownership_strategy = "first_come"
+# Enable partial close: when target partially reduces, reduce our position proportionally
+enable_partial_close = true
+# Local state cache TTL in seconds for our and target wallet positions (lower = fresher, higher = less API calls)
+local_cache_ttl_secs = 3
+# API timeout threshold in seconds for smart degradation (fallback to local ledger decisions)
+api_timeout_degrade_secs = 3

@@ -179,6 +179,8 @@ function App() {
           dailyStartBalance={state.daily_start_balance || '0'}
           dailyLossTriggered={state.daily_loss_triggered || false}
           slStatus={state.sl_status || []}
+          tokenOwnershipStrategy={state.token_ownership_strategy || 'first_come'}
+          enablePartialClose={state.enable_partial_close ?? true}
         />
       ) : activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>

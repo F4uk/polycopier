@@ -47,6 +47,7 @@ pub struct BotConfig {
     pub risk_guard: RiskGuardConfig,
     pub market_filter: MarketFilterConfig,
     pub telegram: TelegramConfig,
+    pub trading: TradingConfig,
 }
 
 /// Copy-trade target wallets — public on-chain addresses, safe in config.toml.
@@ -161,6 +162,24 @@ pub struct TelegramConfig {
     pub min_pnl_usd: Decimal,
 }
 
+/// Trading strategy config: token ownership, partial close, and API latency tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingConfig {
+    /// Token ownership strategy: "first_come" | "win_rate_priority" | "multi_wallet_average" | "whitelist_only".
+    /// - first_come: first wallet to BUY owns the token (original behavior).
+    /// - win_rate_priority: highest win-rate wallet owns the token.
+    /// - multi_wallet_average: average across all wallets holding the token.
+    /// - whitelist_only: only copy from whitelisted wallets (target_scalars > 0).
+    pub token_ownership_strategy: String,
+    /// Enable partial close support: when target partially reduces, reduce our position proportionally.
+    pub enable_partial_close: bool,
+    /// Local state cache TTL in seconds for our and target wallet positions.
+    pub local_cache_ttl_secs: u64,
+    /// API timeout threshold in seconds for smart degradation.
+    /// When exceeded, prioritize local ledger decisions over live API calls.
+    pub api_timeout_degrade_secs: u64,
+}
+
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
@@ -218,6 +237,12 @@ impl Default for BotConfig {
                 bot_token: String::new(),
                 chat_id: String::new(),
                 min_pnl_usd: Decimal::ZERO,
+            },
+            trading: TradingConfig {
+                token_ownership_strategy: "first_come".to_string(),
+                enable_partial_close: true,
+                local_cache_ttl_secs: 3,
+                api_timeout_degrade_secs: 3,
             },
         }
     }
@@ -277,6 +302,11 @@ pub struct Config {
     pub telegram_bot_token: String,
     pub telegram_chat_id: String,
     pub telegram_min_pnl_usd: Decimal,
+    // Trading strategy
+    pub token_ownership_strategy: String,
+    pub enable_partial_close: bool,
+    pub local_cache_ttl_secs: u64,
+    pub api_timeout_degrade_secs: u64,
     pub is_sim: bool,
     pub sim_balance: Option<rust_decimal::Decimal>,
 }
@@ -431,7 +461,20 @@ bot_token = "{tg_token}"
 chat_id = "{tg_chat}"
 # Minimum PnL event to trigger notification (USD). 0 = all events.
 min_pnl_usd = {tg_pnl}
-"#,
+
+[trading]
+# Token ownership strategy: first_come | win_rate_priority | multi_wallet_average | whitelist_only
+#   first_come         -- first wallet to BUY owns the token (original behavior)
+#   win_rate_priority  -- highest win-rate wallet owns the token
+#   multi_wallet_average -- average across all wallets holding the token
+#   whitelist_only     -- only copy from whitelisted wallets (target_scalars > 0)
+token_ownership_strategy = "{tos}"
+# Enable partial close: when target partially reduces, reduce our position proportionally
+enable_partial_close = {epc}
+# Local state cache TTL in seconds for our and target wallet positions
+local_cache_ttl_secs = {cache_ttl}
+# API timeout threshold in seconds for smart degradation (fallback to local ledger)
+api_timeout_degrade_secs = {api_degrade}"#,
         wallets = wallets_toml,
         slippage = cfg.execution.max_slippage_pct,
         max_trade = cfg.execution.max_trade_size_usd,
@@ -471,6 +514,10 @@ min_pnl_usd = {tg_pnl}
         tg_token = cfg.telegram.bot_token,
         tg_chat = cfg.telegram.chat_id,
         tg_pnl = cfg.telegram.min_pnl_usd,
+        tos = cfg.trading.token_ownership_strategy,
+        epc = cfg.trading.enable_partial_close,
+        cache_ttl = cfg.trading.local_cache_ttl_secs,
+        api_degrade = cfg.trading.api_timeout_degrade_secs,
     );
     fs::write(CONFIG_TOML_PATH, content)?;
     Ok(())
@@ -635,6 +682,25 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
             bot_token: e("TELEGRAM_BOT_TOKEN"),
             chat_id: e("TELEGRAM_CHAT_ID"),
             min_pnl_usd: dec("TELEGRAM_MIN_PNL_USD", defaults.telegram.min_pnl_usd),
+        },
+        trading: TradingConfig {
+            token_ownership_strategy: e("TOKEN_OWNERSHIP_STRATEGY")
+                .parse::<String>()
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(defaults.trading.token_ownership_strategy),
+            enable_partial_close: env::var("ENABLE_PARTIAL_CLOSE")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(defaults.trading.enable_partial_close),
+            local_cache_ttl_secs: u64v(
+                "LOCAL_CACHE_TTL_SECS",
+                defaults.trading.local_cache_ttl_secs,
+            ),
+            api_timeout_degrade_secs: u64v(
+                "API_TIMEOUT_DEGRADE_SECS",
+                defaults.trading.api_timeout_degrade_secs,
+            ),
         },
     }
 }
@@ -864,6 +930,10 @@ impl Config {
             telegram_bot_token: cfg.telegram.bot_token,
             telegram_chat_id: cfg.telegram.chat_id,
             telegram_min_pnl_usd: cfg.telegram.min_pnl_usd,
+            token_ownership_strategy: cfg.trading.token_ownership_strategy,
+            enable_partial_close: cfg.trading.enable_partial_close,
+            local_cache_ttl_secs: cfg.trading.local_cache_ttl_secs,
+            api_timeout_degrade_secs: cfg.trading.api_timeout_degrade_secs,
             is_sim: false, // Injected dynamically in Config::load_or_prompt wrapper
             sim_balance: None,
         }

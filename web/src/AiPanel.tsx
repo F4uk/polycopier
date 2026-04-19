@@ -6,6 +6,7 @@ interface WalletStats {
   losses: number;
   total_pnl: string;
   consecutive_losses: number;
+  weight: string;
 }
 
 interface PnlSnapshot {
@@ -51,6 +52,8 @@ interface AiPanelProps {
   dailyStartBalance: string;
   dailyLossTriggered: boolean;
   slStatus: TrackedPositionStatus[];
+  tokenOwnershipStrategy: string;
+  enablePartialClose: boolean;
 }
 
 export default function AiPanel({
@@ -69,6 +72,8 @@ export default function AiPanel({
   dailyStartBalance,
   dailyLossTriggered,
   slStatus,
+  tokenOwnershipStrategy,
+  enablePartialClose,
 }: AiPanelProps) {
   const [muteInput, setMuteInput] = useState('');
   const [muteMsg, setMuteMsg] = useState('');
@@ -372,6 +377,23 @@ export default function AiPanel({
         </div>
       </div>
 
+      {/* Trading Strategy Banner */}
+      <div className="glass-panel" style={{
+        background: 'rgba(96,165,250,0.06)',
+        border: '1px solid rgba(96,165,250,0.2)',
+        padding: '10px 16px',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', fontSize: '0.85rem' }}>
+          <span style={{ color: '#60a5fa', fontWeight: 600 }}>Trading Strategy</span>
+          <span style={{ fontFamily: 'monospace', color: 'var(--text-primary)' }}>
+            Ownership: <span style={{ color: '#fbbf24' }}>{tokenOwnershipStrategy}</span>
+          </span>
+          <span style={{ fontFamily: 'monospace', color: 'var(--text-primary)' }}>
+            Partial Close: <span style={{ color: enablePartialClose ? '#4ade80' : '#f87171' }}>{enablePartialClose ? 'ON' : 'OFF'}</span>
+          </span>
+        </div>
+      </div>
+
       {/* Per-Wallet Stats + Blacklist */}
       <div className="glass-panel">
         <div className="panel-header">
@@ -385,6 +407,7 @@ export default function AiPanel({
             <thead>
               <tr>
                 <th>Wallet</th>
+                <th>Weight</th>
                 <th>Total Copies</th>
                 <th>Wins</th>
                 <th>Losses</th>
@@ -411,6 +434,9 @@ export default function AiPanel({
                           </span>
                         )}
                       </div>
+                    </td>
+                    <td style={{ fontFamily: 'monospace', color: parseFloat(stats.weight) !== 1 ? '#fbbf24' : 'var(--text-secondary)', fontSize: '0.8rem' }}>
+                      {parseFloat(stats.weight).toFixed(2)}x
                     </td>
                     <td>{stats.total_copies}</td>
                     <td className="val-positive">{stats.wins}</td>
@@ -449,7 +475,7 @@ export default function AiPanel({
               })}
               {wallets.length === 0 && (
                 <tr>
-                  <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>
+                  <td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>
                     No copy history yet. Stats will appear after positions are closed.
                   </td>
                 </tr>

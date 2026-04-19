@@ -209,10 +209,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("===========================================================");
     }
 
-    let state = Arc::new(RwLock::new(state::BotState::new(
-        config.is_sim,
-        config.sim_balance,
-    )));
+    let state = {
+        let mut bot_state = state::BotState::new(config.is_sim, config.sim_balance);
+        bot_state.token_ownership_strategy = config.token_ownership_strategy.clone();
+        bot_state.enable_partial_close = config.enable_partial_close;
+        Arc::new(RwLock::new(bot_state))
+    };
     // Wrap RiskEngine in Arc<Mutex<>> so both strategy engine and order watcher
     // can reference it — order watcher calls record_loss() on loss-triggered cancels.
     let risk_engine = Arc::new(Mutex::new(risk::RiskEngine::new(config.clone())));

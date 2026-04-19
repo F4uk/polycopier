@@ -10,6 +10,7 @@ use alloy::primitives::Address;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::data::Client as DataClient;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -216,6 +217,120 @@ impl LiveQueryCache {
 }
 
 // ---------------------------------------------------------------------------
+// Local state cache (optimization: avoid redundant API calls)
+// ---------------------------------------------------------------------------
+
+/// Cached position state for a wallet+token pair.
+/// Avoids repeated API calls within the configured TTL window.
+struct LocalStateCache {
+    /// Maps "wallet:token_id" → (holds: bool, inserted_at: Instant)
+    inner: HashMap<String, (bool, Instant)>,
+    /// TTL in seconds (from config.trading.local_cache_ttl_secs).
+    ttl_secs: u64,
+}
+
+impl LocalStateCache {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            inner: HashMap::new(),
+            ttl_secs,
+        }
+    }
+
+    fn get(&self, wallet: &str, token_id: &str) -> Option<bool> {
+        let key = format!("{wallet}:{token_id}");
+        self.inner.get(&key).and_then(|(holds, inserted)| {
+            if inserted.elapsed().as_secs() < self.ttl_secs.max(1) {
+                Some(*holds)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set(&mut self, wallet: &str, token_id: &str, holds: bool) {
+        let key = format!("{wallet}:{token_id}");
+        self.inner.insert(key, (holds, Instant::now()));
+    }
+
+    fn evict_expired(&mut self) {
+        let ttl = self.ttl_secs.max(1) * 4;
+        self.inner.retain(|_, (_, t)| t.elapsed().as_secs() < ttl);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preload cache (optimization: pre-warm target wallet state)
+// ---------------------------------------------------------------------------
+
+/// Tracks which wallets we've recently preloaded for a given token,
+/// so we don't redundantly preload the same wallet within the cooldown.
+struct PreloadTracker {
+    /// Maps "wallet:token_id" → Instant of last preload
+    inner: HashMap<String, Instant>,
+}
+
+impl PreloadTracker {
+    fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Returns true if this wallet+token was preloaded recently (< 10s).
+    fn was_recently_preloaded(&self, wallet: &str, token_id: &str) -> bool {
+        let key = format!("{wallet}:{token_id}");
+        self.inner
+            .get(&key)
+            .map(|t| t.elapsed().as_secs() < 10)
+            .unwrap_or(false)
+    }
+
+    fn mark_preloaded(&mut self, wallet: &str, token_id: &str) {
+        let key = format!("{wallet}:{token_id}");
+        self.inner.insert(key, Instant::now());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token ownership strategy
+// ---------------------------------------------------------------------------
+
+/// Token ownership strategy determines which wallet "owns" a token when
+/// multiple targets hold it simultaneously.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TokenOwnershipStrategy {
+    /// First wallet to BUY owns the token (original behavior).
+    FirstCome,
+    /// Highest win-rate wallet owns the token.
+    WinRatePriority,
+    /// Average across all wallets holding the token.
+    MultiWalletAverage,
+    /// Only copy from whitelisted wallets (those with a :weight suffix in config).
+    WhitelistOnly,
+}
+
+impl TokenOwnershipStrategy {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "win_rate_priority" => Self::WinRatePriority,
+            "multi_wallet_average" => Self::MultiWalletAverage,
+            "whitelist_only" => Self::WhitelistOnly,
+            _ => Self::FirstCome,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FirstCome => "first_come",
+            Self::WinRatePriority => "win_rate_priority",
+            Self::MultiWalletAverage => "multi_wallet_average",
+            Self::WhitelistOnly => "whitelist_only",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Injectable live position checker
 // ---------------------------------------------------------------------------
 
@@ -351,6 +466,20 @@ pub fn start_strategy_engine(
     tokio::spawn(async move {
         info!("Strategy Engine Started. Monitoring edge cases (debouncing, closures...)");
 
+        // Initialize wallet weights in BotState from config.target_scalars
+        {
+            let mut guard = state.write().await;
+            for wallet in &config.target_wallets {
+                let weight = config
+                    .target_scalars
+                    .get(wallet)
+                    .cloned()
+                    .unwrap_or(Decimal::ONE);
+                let stats = guard.wallet_stats.entry(wallet.clone()).or_default();
+                stats.weight = weight;
+            }
+        }
+
         let mut debounce = DebounceCache::new();
         let mut live_cache = LiveQueryCache::new();
         let mut end_date_cache = EndDateCache::new();
@@ -359,11 +488,28 @@ pub fn start_strategy_engine(
         // Periodic cache maintenance counter
         let mut event_count: u32 = 0;
 
+        // --- Optimization: local state cache (1.5s TTL, configurable) ---
+        let mut local_cache = LocalStateCache::new(config.local_cache_ttl_secs);
+        // --- Optimization: preload tracker ---
+        let mut preload_tracker = PreloadTracker::new();
+        // --- Optimization: token ownership strategy ---
+        let ownership_strategy = TokenOwnershipStrategy::parse(&config.token_ownership_strategy);
+        info!(
+            "Token ownership strategy: {} | partial_close={} | local_cache_ttl={}s | api_degrade={}s",
+            ownership_strategy.as_str(),
+            config.enable_partial_close,
+            config.local_cache_ttl_secs,
+            config.api_timeout_degrade_secs,
+        );
+        // --- Optimization: API degradation state ---
+        let mut api_degraded: bool = false;
+
         while let Some(event) = rx.recv().await {
             event_count += 1;
             // Evict expired live-query cache entries every 50 events (Gap 13)
             if event_count.is_multiple_of(50) {
                 live_cache.evict_expired();
+                local_cache.evict_expired();
             }
 
             let mut eval = EvaluatedTrade {
@@ -373,9 +519,27 @@ pub fn start_strategy_engine(
             };
 
             // 1. Is it a filled trade from the target wallet list?
+            //    Also: Optimization — whitelist_only strategy blocks non-whitelisted wallets.
             if !config.target_wallets.contains(&event.taker_address) {
                 eval.validated = false;
                 eval.reason = Some("Wallet mismatch".to_string());
+            } else if ownership_strategy == TokenOwnershipStrategy::WhitelistOnly {
+                // whitelist_only: only copy from wallets that have a :weight suffix
+                if !config.target_scalars.contains_key(&event.taker_address) {
+                    eval.validated = false;
+                    eval.reason =
+                        Some("Wallet not in whitelist (whitelist_only strategy)".to_string());
+                }
+            }
+
+            // --- Optimization: pre-warm target wallet state ---
+            // When we see a trade from a target, preload their position state
+            // so the subsequent live verification can use cached data.
+            if eval.validated
+                && !preload_tracker.was_recently_preloaded(&event.taker_address, &event.token_id)
+            {
+                let _ = holds_query(event.taker_address.clone(), event.token_id.clone()).await;
+                preload_tracker.mark_preloaded(&event.taker_address, &event.token_id);
             }
 
             // 2. Fragmented fill debounce (Gap 5 — bounded cache with TTL eviction)
@@ -511,7 +675,7 @@ pub fn start_strategy_engine(
             if eval.validated {
                 // --- Resolve live state for this token ---
 
-                // Our position: check cache first, then live API
+                // Our position: check local cache first, then BotState, then live API
                 let cache_we_hold = {
                     let guard = state.read().await;
                     guard.positions.contains_key(&event.token_id)
@@ -523,20 +687,39 @@ pub fn start_strategy_engine(
                     })
                 };
 
+                // --- Optimization: local state cache (avoids BotState locks + API calls) ---
+                let local_we_hold = local_cache.get(&config.funder_address, &event.token_id);
+                let local_target_holds = local_cache.get(&event.taker_address, &event.token_id);
+
                 // Check live-query cache before making API calls (Gap 13)
                 let our_cached = live_cache.get(&config.funder_address, &event.token_id);
                 let target_cached = live_cache.get(&event.taker_address, &event.token_id);
 
-                let (live_we_hold, live_target_holds) = if our_cached.is_some()
-                    && target_cached.is_some()
-                {
-                    // Both are cached — no API call needed
+                // --- Optimization: smart degradation ---
+                // If API has been degraded (too slow), prioritize local data + ledger.
+                // Otherwise, run live API queries in parallel.
+                let (live_we_hold, live_target_holds) = if api_degraded {
+                    // Degraded mode: use local cache + ledger, skip live API
+                    let we_hold = local_we_hold.or(our_cached).unwrap_or(cache_we_hold);
+                    let target_holds = local_target_holds
+                        .or(target_cached)
+                        .unwrap_or(cache_target_holds);
+                    (we_hold, target_holds)
+                } else if local_we_hold.is_some() && local_target_holds.is_some() {
+                    // Both available in local cache — no API call needed
+                    (
+                        local_we_hold.unwrap_or(cache_we_hold),
+                        local_target_holds.unwrap_or(cache_target_holds),
+                    )
+                } else if our_cached.is_some() && target_cached.is_some() {
+                    // Both are in live-query cache — no API call needed
                     (
                         our_cached.unwrap_or(cache_we_hold),
                         target_cached.unwrap_or(cache_target_holds),
                     )
                 } else {
-                    // Run whichever queries are needed in parallel
+                    // Run whichever queries are needed in parallel with timeout
+                    let api_start = Instant::now();
                     let (live_we_hold_opt, live_target_holds_opt) = tokio::join!(
                         async {
                             if let Some(cached) = our_cached {
@@ -556,12 +739,33 @@ pub fn start_strategy_engine(
                         },
                     );
 
+                    let api_elapsed = api_start.elapsed().as_secs();
+                    // --- Optimization: smart degradation check ---
+                    if api_elapsed >= config.api_timeout_degrade_secs {
+                        if !api_degraded {
+                            warn!(
+                                "[Degradation] API latency {}s >= threshold {}s — switching to local-ledger mode",
+                                api_elapsed, config.api_timeout_degrade_secs
+                            );
+                            api_degraded = true;
+                        }
+                    } else if api_degraded {
+                        // API recovered — exit degradation mode
+                        info!(
+                            "[Degradation] API latency recovered ({}s) — exiting degraded mode",
+                            api_elapsed
+                        );
+                        api_degraded = false;
+                    }
+
                     let we_hold = live_we_hold_opt.unwrap_or(cache_we_hold);
                     let target_holds = live_target_holds_opt.unwrap_or(cache_target_holds);
 
-                    // Populate cache with fresh results
+                    // Populate both caches with fresh results
                     live_cache.set(&config.funder_address, &event.token_id, we_hold);
                     live_cache.set(&event.taker_address, &event.token_id, target_holds);
+                    local_cache.set(&config.funder_address, &event.token_id, we_hold);
+                    local_cache.set(&event.taker_address, &event.token_id, target_holds);
 
                     (we_hold, target_holds)
                 };
@@ -573,6 +777,12 @@ pub fn start_strategy_engine(
                 };
                 let already_in_token = ledger_entry.is_some();
 
+                // --- Token ownership strategy ---
+                // When we already hold a token from wallet A and wallet B also buys:
+                // - first_come: skip (original behavior)
+                // - win_rate_priority: if wallet B has higher win rate, transfer ownership
+                // - multi_wallet_average: allow multiple wallets, average sizing
+                // - whitelist_only: already filtered above, treat as first_come here
                 let skip_reason: Option<String> = match event.side {
                     // ---- BUY -----------------------------------------------
                     TradeSide::BUY => {
@@ -581,11 +791,85 @@ pub fn start_strategy_engine(
                                 .as_ref()
                                 .map(|e| &e.source_wallet[..e.source_wallet.len().min(10)])
                                 .unwrap_or("unknown");
-                            Some(format!(
-                                "BUY skipped: already holding token {} (entered from {})",
-                                &event.token_id[..event.token_id.len().min(12)],
-                                from
-                            ))
+                            match ownership_strategy {
+                                TokenOwnershipStrategy::WinRatePriority => {
+                                    // Check if this wallet has a better win rate
+                                    let current_wallet =
+                                        ledger_entry.as_ref().map(|e| e.source_wallet.clone());
+                                    let should_transfer = if let Some(ref cur_wallet) =
+                                        current_wallet
+                                    {
+                                        let guard = state.read().await;
+                                        let cur_stats = guard.wallet_stats.get(cur_wallet);
+                                        let new_stats =
+                                            guard.wallet_stats.get(&event.taker_address);
+                                        match (cur_stats, new_stats) {
+                                            (Some(cs), Some(ns)) => {
+                                                let cur_wr = if cs.wins + cs.losses > 0 {
+                                                    cs.wins as f64 / (cs.wins + cs.losses) as f64
+                                                } else {
+                                                    0.5
+                                                };
+                                                let new_wr = if ns.wins + ns.losses > 0 {
+                                                    ns.wins as f64 / (ns.wins + ns.losses) as f64
+                                                } else {
+                                                    0.5
+                                                };
+                                                new_wr > cur_wr
+                                            }
+                                            (None, Some(_)) => true, // new wallet has stats, current doesn't
+                                            _ => false,
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if should_transfer {
+                                        info!(
+                                            "[Ownership] Transferring token {} from {} to {} (win_rate_priority)",
+                                            &event.token_id[..event.token_id.len().min(12)],
+                                            from,
+                                            &event.taker_address[..event.taker_address.len().min(10)],
+                                        );
+                                        // Transfer ownership: update the ledger entry's source_wallet
+                                        {
+                                            let mut ledger = copy_ledger.lock().await;
+                                            if let Some(entry) =
+                                                ledger.entries.iter_mut().rev().find(|e| {
+                                                    !e.closed && e.token_id == event.token_id
+                                                })
+                                            {
+                                                entry.source_wallet = event.taker_address.clone();
+                                                ledger.save();
+                                            }
+                                        }
+                                        None // Allow: ownership transferred
+                                    } else {
+                                        Some(format!(
+                                            "BUY skipped: already holding token {} (entered from {}, win_rate_priority: current is better)",
+                                            &event.token_id[..event.token_id.len().min(12)],
+                                            from
+                                        ))
+                                    }
+                                }
+                                TokenOwnershipStrategy::MultiWalletAverage => {
+                                    // Allow multiple wallets to hold the same token
+                                    // Don't skip — we'll just track the new source
+                                    info!(
+                                        "[Ownership] Multi-wallet: token {} also held by {} (multi_wallet_average)",
+                                        &event.token_id[..event.token_id.len().min(12)],
+                                        &event.taker_address[..event.taker_address.len().min(10)],
+                                    );
+                                    None // Allow: multi-wallet
+                                }
+                                _ => {
+                                    // first_come / whitelist_only: original behavior — skip
+                                    Some(format!(
+                                        "BUY skipped: already holding token {} (entered from {})",
+                                        &event.token_id[..event.token_id.len().min(12)],
+                                        from
+                                    ))
+                                }
+                            }
                         } else if !live_target_holds && live_we_hold {
                             Some(
                                 "BUY skipped: we hold long but target has no position \
@@ -598,10 +882,146 @@ pub fn start_strategy_engine(
                     }
                     // ---- SELL ----------------------------------------------
                     TradeSide::SELL => {
+                        // --- Optimization: partial close support ---
+                        // If enable_partial_close and the target only partially reduced,
+                        // we reduce our position proportionally instead of closing entirely.
                         if live_we_hold {
                             match &ledger_entry {
                                 Some(entry) if entry.source_wallet == event.taker_address => {
-                                    None // Correct source is selling → close
+                                    // Correct source is selling — check for partial close
+                                    let mut is_partial_close = false;
+                                    if config.enable_partial_close {
+                                        let our_held_size = {
+                                            let guard = state.read().await;
+                                            guard
+                                                .positions
+                                                .get(&event.token_id)
+                                                .map(|p| p.size)
+                                                .unwrap_or(Decimal::ZERO)
+                                        };
+                                        // Target's current size in this token (from target_positions)
+                                        let target_current_size = {
+                                            let guard = state.read().await;
+                                            guard
+                                                .target_positions
+                                                .iter()
+                                                .find(|p| {
+                                                    p.token_id == event.token_id
+                                                        && p.source_wallet == event.taker_address
+                                                })
+                                                .map(|p| p.size)
+                                                .unwrap_or(Decimal::ZERO)
+                                        };
+                                        // If target still holds shares after the SELL, this is a partial reduction
+                                        if target_current_size > Decimal::ZERO
+                                            && our_held_size > Decimal::ZERO
+                                        {
+                                            let total_target_before =
+                                                target_current_size + event.size;
+                                            if total_target_before > Decimal::ZERO {
+                                                let reduction_ratio =
+                                                    event.size / total_target_before;
+                                                let our_reduction =
+                                                    (our_held_size * reduction_ratio).round_dp(2);
+                                                if our_reduction >= Decimal::from(5)
+                                                    && our_reduction < our_held_size
+                                                {
+                                                    is_partial_close = true;
+                                                    // Partial close: reduce our position proportionally
+                                                    info!(
+                                                        "[PartialClose] Token {} reducing by {:.2} shares ({:.1}% of our {:.2}), target reduced {:.1}%",
+                                                        &event.token_id[..event.token_id.len().min(12)],
+                                                        our_reduction,
+                                                        reduction_ratio * dec!(100),
+                                                        our_held_size,
+                                                        reduction_ratio * dec!(100),
+                                                    );
+                                                    // Submit partial sell order
+                                                    let partial_limit_price = calculate_limit_price(
+                                                        event.price,
+                                                        TradeSide::SELL,
+                                                        config.max_slippage_pct,
+                                                    );
+                                                    let partial_order = OrderRequest {
+                                                        token_id: event.token_id.clone(),
+                                                        price: partial_limit_price,
+                                                        size: our_reduction,
+                                                        side: TradeSide::SELL,
+                                                    };
+                                                    let partial_submitter = submitter.clone();
+                                                    let partial_token_id = event.token_id.clone();
+                                                    let partial_source =
+                                                        event.taker_address.clone();
+                                                    let partial_ledger = copy_ledger.clone();
+                                                    let partial_state = state.clone();
+                                                    let partial_sl = sl_state.clone();
+                                                    let partial_entry_price = entry.entry_price;
+                                                    tokio::spawn(async move {
+                                                        match partial_submitter(partial_order).await
+                                                        {
+                                                            Ok(()) => {
+                                                                info!(
+                                                                    "[PartialClose] Sold {:.2} shares of {}",
+                                                                    our_reduction,
+                                                                    &partial_token_id[..partial_token_id.len().min(12)],
+                                                                );
+                                                                // Don't close ledger entry — keep it open for future partials
+                                                                // Update the filled_size in the ledger
+                                                                {
+                                                                    let mut ledger =
+                                                                        partial_ledger.lock().await;
+                                                                    ledger.update_fill(
+                                                                        &partial_token_id,
+                                                                        our_held_size
+                                                                            - our_reduction,
+                                                                    );
+                                                                }
+                                                                // Update SL state: remove and re-record with adjusted position
+                                                                {
+                                                                    let mut sl_guard =
+                                                                        partial_sl.lock().await;
+                                                                    sl_guard
+                                                                        .remove(&partial_token_id);
+                                                                    // wallet_sync will re-record if needed
+                                                                }
+                                                                // Record realized PnL for the partial close
+                                                                let partial_pnl = (event.price
+                                                                    - partial_entry_price)
+                                                                    * our_reduction;
+                                                                let mut guard =
+                                                                    partial_state.write().await;
+                                                                guard.realized_pnl += partial_pnl;
+                                                                if partial_pnl >= Decimal::ZERO {
+                                                                    guard.record_win(
+                                                                        &partial_source,
+                                                                        partial_pnl,
+                                                                    );
+                                                                } else {
+                                                                    guard.record_loss(
+                                                                        &partial_source,
+                                                                        partial_pnl,
+                                                                    );
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(
+                                                                    "[PartialClose] Failed to sell partial of {}: {}",
+                                                                    &partial_token_id[..partial_token_id.len().min(12)],
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if is_partial_close {
+                                        // Partial close handled — skip the normal full-close flow
+                                        Some("Partial close executed".to_string())
+                                    } else {
+                                        None // Full close → proceed normally
+                                    }
                                 }
                                 Some(entry) => Some(format!(
                                     "SELL skipped: {} sold but we copied from {} — \
