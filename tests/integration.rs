@@ -18,6 +18,14 @@ use std::collections::HashSet;
 
 // -- Shared test helpers -------------------------------------------------------
 
+/// Create a default StopLossState for tests (disabled, no-op).
+fn test_sl_state() -> std::sync::Arc<tokio::sync::Mutex<polycopier::stop_loss::StopLossState>> {
+    use rust_decimal::Decimal;
+    std::sync::Arc::new(tokio::sync::Mutex::new(
+        polycopier::stop_loss::StopLossState::new(false, Decimal::ZERO, Decimal::ZERO, 60),
+    ))
+}
+
 fn test_config() -> polycopier::config::Config {
     polycopier::config::Config {
         private_key: "0xdeadbeef".to_string(),
@@ -41,6 +49,26 @@ fn test_config() -> polycopier::config::Config {
         max_consecutive_losses: 0,
         loss_cooldown_secs: 300,
         ignore_closing_in_mins: None,
+        stop_loss_enabled: false,
+        force_stop_price: dec!(0),
+        force_close_price: dec!(0),
+        stop_loss_check_interval_secs: 60,
+        max_daily_loss_pct: dec!(0),
+        max_single_loss_usd: dec!(0),
+        wallet_blacklist_consecutive_losses: 0,
+        wallet_blacklist_min_win_rate: dec!(0),
+        category_blacklist: vec![],
+        min_hours_to_expiry: dec!(0),
+        min_volume_1h_usd: dec!(0),
+        max_spread_pct: dec!(0.025),
+        min_holders: 0,
+        telegram_bot_token: String::new(),
+        telegram_chat_id: String::new(),
+        telegram_min_pnl_usd: dec!(0),
+        token_ownership_strategy: "first_come".to_string(),
+        enable_partial_close: true,
+        local_cache_ttl_secs: 3,
+        api_timeout_degrade_secs: 5,
         is_sim: false,
         sim_balance: None,
     }
@@ -196,6 +224,7 @@ mod end_date_tests {
             copy_ledger,
             make_no_op_holds_query(),
             custom_query,
+            test_sl_state(),
         );
 
         let event = make_trade("0xabc", dec!(0.5), dec!(100), TradeSide::BUY);
@@ -1037,6 +1066,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // Seed sufficient balance so the pre-check doesn't block submission
@@ -1072,6 +1102,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         tx.send(make_trade(
@@ -1106,6 +1137,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // Seed sufficient balance so the pre-check doesn't block submission
@@ -1141,6 +1173,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // $0.05 * 0.01 = $0.0005 - below $1 spoofing threshold
@@ -1180,6 +1213,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // SELL: 0.60 - (0.60 * 0.02) = 0.588
@@ -1222,6 +1256,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // Target sells 500 shares - we hold only 20
@@ -1266,6 +1301,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         tx.send(make_trade("0xabc", dec!(0.60), dec!(10), TradeSide::SELL))
@@ -1298,6 +1334,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         tx.send(make_trade("0xabc", dec!(0.50), dec!(100), TradeSide::SELL))
@@ -1335,6 +1372,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // Target sells "99999" but has no prior long position -> short entry
@@ -1381,6 +1419,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         tx.send(make_trade("0xabc", dec!(0.50), dec!(10), TradeSide::BUY))
@@ -1424,6 +1463,7 @@ mod strategy_engine_tests {
             test_ledger(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         tx.send(make_trade("0xabc", dec!(0.60), dec!(3), TradeSide::SELL))
@@ -1485,6 +1525,7 @@ mod strategy_engine_tests {
             ledger,
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // Second target (0xabc again, or any other) tries to BUY same token
@@ -1538,6 +1579,7 @@ mod strategy_engine_tests {
             ledger,
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // 0xabc (our copy source) sells → should trigger close
@@ -1589,6 +1631,7 @@ mod strategy_engine_tests {
             ledger,
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         // 0xdef (NOT our copy source) sells — must be ignored
@@ -1634,6 +1677,7 @@ mod strategy_engine_tests {
             ledger,
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            test_sl_state(),
         );
 
         tx.send(make_trade("0xabc", dec!(0.60), dec!(10), TradeSide::SELL))

@@ -9,7 +9,6 @@
 //! | `seed_own_positions`       | once     | `state.positions` (boot snapshot)             |
 //! | `seed_pending_orders`      | once     | `state.pending_order_tokens` (boot snapshot)  |
 //! | `start_position_sync`      | 30 s     | `state.positions` (fill tracking, Gap 4)      |
-//! | `start_price_refresh`      | 20 s     | `state.target_positions[*].cur_price`+PnL     |
 //! | `start_balance_poll`       | 10 s     | `state.total_balance`                         |
 //! | `start_position_close_sweep` | 60 s   | synthetic SELL events (Gap 2 fix)             |
 
@@ -22,7 +21,7 @@ use alloy::primitives::Address;
 use polymarket_client_sdk::clob::types::request::OrdersRequest;
 use polymarket_client_sdk::data::Client as DataClient;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -176,87 +175,7 @@ pub fn start_position_sync(
 }
 
 // ---------------------------------------------------------------------------
-// 3. Price refresh — runs every 20 s, updates cur_price on each
-//    target_position entry so the TUI scanner table shows live prices
-//    independent of the scanner's adaptive interval.
-//
-//    Gap 7: unrealized PnL is now computed from OUR positions (state.positions)
-//    keyed against the fresh price_map, with a fallback to avg_entry if a
-//    price is not in the map.  This prevents tokens that closed between
-//    refreshes from contributing 0 to the total.
-// ---------------------------------------------------------------------------
-pub fn start_price_refresh(target_wallets: Vec<String>, state: State) {
-    tokio::spawn(async move {
-        let client = DataClient::default();
-        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-        let mut consecutive_errors: u32 = 0;
-        loop {
-            let mut price_map: HashMap<String, Decimal> = HashMap::new();
-            let mut had_error = false;
-            for wallet_str in &target_wallets {
-                let wallet_str = wallet_str.trim();
-                if let Ok(addr) = Address::from_str(wallet_str) {
-                    match crate::utils::fetch_all_positions(&client, addr).await {
-                        Ok(ps) => {
-                            for p in ps {
-                                price_map.insert(p.asset.to_string(), p.cur_price);
-                            }
-                        }
-                        Err(e) => {
-                            had_error = true;
-                            tracing::warn!(
-                                "Price refresh failed for {}: {e} (consecutive={})",
-                                &wallet_str[..wallet_str.len().min(10)],
-                                consecutive_errors + 1
-                            );
-                        }
-                    }
-                }
-            }
-
-            if had_error {
-                consecutive_errors += 1;
-            } else {
-                consecutive_errors = 0;
-            }
-
-            if !price_map.is_empty() || !had_error {
-                let mut g = state.write().await;
-
-                // Update cur_price on target_positions
-                for tp in g.target_positions.iter_mut() {
-                    if let Some(&fresh_price) = price_map.get(&tp.token_id) {
-                        tp.cur_price = fresh_price;
-                    }
-                }
-                g.last_price_refresh_at = Some(std::time::Instant::now());
-
-                // Gap 7: recompute unrealized PnL from OUR positions, falling back
-                // to avg_entry (PnL = 0) when a token is absent from price_map.
-                // This is correct regardless of whether a target has already closed.
-                let unrealized: Decimal = g
-                    .positions
-                    .values()
-                    .map(|p| {
-                        let cur = price_map
-                            .get(&p.token_id)
-                            .copied()
-                            .unwrap_or(p.average_entry_price);
-                        (cur - p.average_entry_price) * p.size
-                    })
-                    .sum();
-                g.unrealized_pnl = unrealized;
-            }
-
-            // Gap 6: backoff on sustained price-refresh errors; base 20s, max 120s.
-            let sleep = next_backoff(consecutive_errors, 20, 120);
-            tokio::time::sleep(tokio::time::Duration::from_secs(sleep)).await;
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// 4. Balance poll — runs every 10 s, keeps state.total_balance current so the
+// 3. Balance poll — runs every 10 s, keeps state.total_balance current so the
 //    TUI header and sizing logic always have an up-to-date USDC balance.
 // ---------------------------------------------------------------------------
 pub fn start_balance_poll(balance_fetcher: BalanceFetcher, state: State) {
@@ -298,16 +217,19 @@ pub fn start_balance_poll(balance_fetcher: BalanceFetcher, state: State) {
 //    exists (defensive-close path — the engine handles this gracefully).
 // ---------------------------------------------------------------------------
 pub fn start_position_close_sweep(
+    config: crate::config::Config,
     state: Arc<RwLock<BotState>>,
     tx: mpsc::Sender<TradeEvent>,
     copy_ledger: Arc<Mutex<CopyLedger>>,
 ) {
     tokio::spawn(async move {
         let client = DataClient::default();
+        // FIX: use the config passed at startup instead of reloading
+        // from disk every 60 seconds. Config changes now require a
+        // bot restart or API-driven hot-reload, which is the standard
+        // pattern for the rest of the codebase.
+        let target_wallets = config.target_wallets.clone();
         loop {
-            // Dynamically load target wallets from config
-            let config = crate::config::Config::reload().unwrap();
-            let target_wallets = config.target_wallets.clone();
             // Snapshot the positions we currently hold.
             let our_positions: Vec<Position> = {
                 let guard = state.read().await;

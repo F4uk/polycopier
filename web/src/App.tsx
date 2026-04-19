@@ -46,7 +46,9 @@ function App() {
     };
     
     fetchState();
-    const interval = setInterval(fetchState, 1000);
+    // FIX: increased from 1s to 3s polling interval to reduce backend
+    // pressure. The state doesn't change fast enough to warrant 1s polling.
+    const interval = setInterval(fetchState, 3000);
     return () => clearInterval(interval);
   }, []);
 

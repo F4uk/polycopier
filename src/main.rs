@@ -1,5 +1,4 @@
 pub mod api;
-pub mod api_control;
 pub mod backoff;
 pub mod clients;
 pub mod config;
@@ -23,6 +22,7 @@ pub mod wash_trade_filter;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use anyhow::Context;
 use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::prelude::*;
 
@@ -68,6 +68,48 @@ fn needs_ui_build() -> bool {
     }
 
     latest_src_mod > dist_mod
+}
+
+/// Build the web UI. Returns Ok(true) if a fresh build was needed,
+/// Ok(false) if nothing changed, or Err on failure.
+fn build_ui() -> anyhow::Result<bool> {
+    if !needs_ui_build() {
+        return Ok(false);
+    }
+
+    // Check Node.js availability
+    let node_check = std::process::Command::new("node").arg("-v").output()?;
+    if !node_check.status.success() {
+        anyhow::bail!(
+            "Node.js is not available. Please install Node.js (https://nodejs.org) and try again."
+        );
+    }
+
+    tracing::info!("Installing npm dependencies...");
+    let install_out = std::process::Command::new("npm")
+        .arg("install")
+        .current_dir("web")
+        .output()
+        .context("Failed to run npm install")?;
+    if !install_out.status.success() {
+        let stderr = String::from_utf8_lossy(&install_out.stderr);
+        anyhow::bail!("npm install failed (exit {}):\n{}", install_out.status, stderr);
+    }
+
+    tracing::info!("Building Web UI...");
+    let build_out = std::process::Command::new("npm")
+        .arg("run")
+        .arg("build")
+        .current_dir("web")
+        .output()
+        .context("Failed to run npm run build")?;
+    if !build_out.status.success() {
+        let stderr = String::from_utf8_lossy(&build_out.stderr);
+        anyhow::bail!("npm run build failed (exit {}):\n{}", build_out.status, stderr);
+    }
+
+    tracing::info!("Web UI successfully built.");
+    Ok(true)
 }
 
 #[tokio::main]
@@ -131,39 +173,10 @@ async fn main() -> anyhow::Result<()> {
         );
     } else if is_ui {
         // Automatically build the UI if it hasn't been built yet or if src/ changed
-        if needs_ui_build() {
-            tracing::info!("UI updates detected. Attempting to build automatically...");
-            let node_check = std::process::Command::new("node").arg("-v").output();
-            if node_check.is_err() {
-                tracing::error!("Node.js and npm are required to build the Web UI. Please install them and try again.");
-                std::process::exit(1);
-            }
-
-            tracing::info!("Installing npm dependencies...");
-            let install_status = std::process::Command::new("npm")
-                .arg("install")
-                .current_dir("web")
-                .status()
-                .expect("Failed to execute npm install");
-
-            if !install_status.success() {
-                tracing::error!("npm install failed.");
-                std::process::exit(1);
-            }
-
-            tracing::info!("Building Web UI...");
-            let build_status = std::process::Command::new("npm")
-                .arg("run")
-                .arg("build")
-                .current_dir("web")
-                .status()
-                .expect("Failed to execute npm run build");
-
-            if !build_status.success() {
-                tracing::error!("npm run build failed.");
-                std::process::exit(1);
-            }
-            tracing::info!("Web UI successfully built.");
+        if let Err(e) = build_ui() {
+            tracing::error!("Web UI build failed: {}.", e);
+            tracing::error!("You can build manually with: cd web && npm install && npm run build");
+            std::process::exit(1);
         }
 
         tracing::info!(
@@ -305,14 +318,14 @@ async fn main() -> anyhow::Result<()> {
     // Position-close sweep — backstop that emits synthetic SELLs for any
     // position we hold that no target still holds (catches missed WS SELL events).
     // Gap 2 fix: pass copy_ledger so sweep uses the correct source_wallet.
-    wallet_sync::start_position_close_sweep(state.clone(), event_tx, copy_ledger.clone());
+    wallet_sync::start_position_close_sweep(config.clone(), state.clone(), event_tx, copy_ledger.clone());
 
     // Copied counter (header "Copied: N" — live API intersection every 30 s)
     copied_counter::start_copied_counter(
         config.funder_address.clone(),
         config.target_wallets.clone(),
         state.clone(),
-        30,
+        120,
     );
 
     // Order watcher (cancel stale GTC orders every 10 s)

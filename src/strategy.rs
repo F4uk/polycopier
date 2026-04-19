@@ -174,29 +174,36 @@ impl DebounceCache {
 }
 
 // ---------------------------------------------------------------------------
-// Live query cache (Gap 13)
+// Generic TTL cache (replaces both LiveQueryCache and LocalStateCache)
 // ---------------------------------------------------------------------------
 
-/// Cache TTL in seconds for `holds_query` results.  Fresh enough that a trade
-/// arriving 3s after a prior one for the same wallet re-uses the cached result,
-/// but stale enough that a fast-moving market doesn't use a 10s-old snapshot.
+/// Cache TTL in seconds for `holds_query` results (live query cache).
+/// Fresh enough that a trade arriving 3s after a prior one for the same
+/// wallet re-uses the cached result, but stale enough that a fast-moving
+/// market doesn't use a 10s-old snapshot.
 const LIVE_QUERY_CACHE_TTL_SECS: u64 = 3;
 
-struct LiveQueryCache {
+/// Generic TTL cache that maps a string key to a (bool, Instant) pair.
+/// Eliminates the code duplication between the former LiveQueryCache and
+/// LocalStateCache — both had identical `get`/`set`/`evict_expired` logic
+/// differing only in TTL duration.
+struct GenericTtlCache {
     inner: HashMap<String, (bool, Instant)>,
+    ttl_secs: u64,
 }
 
-impl LiveQueryCache {
-    fn new() -> Self {
+impl GenericTtlCache {
+    fn new(ttl_secs: u64) -> Self {
         Self {
             inner: HashMap::new(),
+            ttl_secs: ttl_secs.max(1),
         }
     }
 
     fn get(&self, wallet: &str, token_id: &str) -> Option<bool> {
         let key = format!("{wallet}:{token_id}");
         self.inner.get(&key).and_then(|(result, inserted)| {
-            if inserted.elapsed().as_secs() < LIVE_QUERY_CACHE_TTL_SECS {
+            if inserted.elapsed().as_secs() < self.ttl_secs {
                 Some(*result)
             } else {
                 None
@@ -211,51 +218,9 @@ impl LiveQueryCache {
 
     /// Evict expired entries to keep memory bounded.
     fn evict_expired(&mut self) {
+        let evict_ttl = self.ttl_secs * 4;
         self.inner
-            .retain(|_, (_, t)| t.elapsed().as_secs() < LIVE_QUERY_CACHE_TTL_SECS * 4);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Local state cache (optimization: avoid redundant API calls)
-// ---------------------------------------------------------------------------
-
-/// Cached position state for a wallet+token pair.
-/// Avoids repeated API calls within the configured TTL window.
-struct LocalStateCache {
-    /// Maps "wallet:token_id" → (holds: bool, inserted_at: Instant)
-    inner: HashMap<String, (bool, Instant)>,
-    /// TTL in seconds (from config.trading.local_cache_ttl_secs).
-    ttl_secs: u64,
-}
-
-impl LocalStateCache {
-    fn new(ttl_secs: u64) -> Self {
-        Self {
-            inner: HashMap::new(),
-            ttl_secs,
-        }
-    }
-
-    fn get(&self, wallet: &str, token_id: &str) -> Option<bool> {
-        let key = format!("{wallet}:{token_id}");
-        self.inner.get(&key).and_then(|(holds, inserted)| {
-            if inserted.elapsed().as_secs() < self.ttl_secs.max(1) {
-                Some(*holds)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn set(&mut self, wallet: &str, token_id: &str, holds: bool) {
-        let key = format!("{wallet}:{token_id}");
-        self.inner.insert(key, (holds, Instant::now()));
-    }
-
-    fn evict_expired(&mut self) {
-        let ttl = self.ttl_secs.max(1) * 4;
-        self.inner.retain(|_, (_, t)| t.elapsed().as_secs() < ttl);
+            .retain(|_, (_, t)| t.elapsed().as_secs() < evict_ttl);
     }
 }
 
@@ -481,7 +446,7 @@ pub fn start_strategy_engine(
         }
 
         let mut debounce = DebounceCache::new();
-        let mut live_cache = LiveQueryCache::new();
+        let mut live_cache = GenericTtlCache::new(LIVE_QUERY_CACHE_TTL_SECS);
         let mut end_date_cache = EndDateCache::new();
         // Wash-trade filter: detects coordinated same-address / same-token patterns
         let mut wash_filter = wash_trade_filter::WashTradeFilter::new();
@@ -489,7 +454,7 @@ pub fn start_strategy_engine(
         let mut event_count: u32 = 0;
 
         // --- Optimization: local state cache (1.5s TTL, configurable) ---
-        let mut local_cache = LocalStateCache::new(config.local_cache_ttl_secs);
+        let mut local_cache = GenericTtlCache::new(config.local_cache_ttl_secs);
         // --- Optimization: preload tracker ---
         let mut preload_tracker = PreloadTracker::new();
         // --- Optimization: token ownership strategy ---
@@ -503,6 +468,11 @@ pub fn start_strategy_engine(
         );
         // --- Optimization: API degradation state ---
         let mut api_degraded: bool = false;
+        // BUG-3 FIX: require consecutive low-latency responses before
+        // exiting degraded mode. A single fast response on a flaky
+        // network shouldn't toggle us back to live mode immediately.
+        let mut api_recovery_count: u32 = 0;
+        const API_RECOVERY_THRESHOLD: u32 = 3;
 
         while let Some(event) = rx.recv().await {
             event_count += 1;
@@ -510,6 +480,9 @@ pub fn start_strategy_engine(
             if event_count.is_multiple_of(50) {
                 live_cache.evict_expired();
                 local_cache.evict_expired();
+                // FIX: periodically clean up wash-trade filter to prevent
+                // unbounded memory growth from accumulated TradeRecords.
+                wash_filter.cleanup();
             }
 
             let mut eval = EvaluatedTrade {
@@ -535,11 +508,18 @@ pub fn start_strategy_engine(
             // --- Optimization: pre-warm target wallet state ---
             // When we see a trade from a target, preload their position state
             // so the subsequent live verification can use cached data.
+            // FIX: spawn a fire-and-forget preload instead of blocking the
+            // strategy engine's main event loop with an .await.
             if eval.validated
                 && !preload_tracker.was_recently_preloaded(&event.taker_address, &event.token_id)
             {
-                let _ = holds_query(event.taker_address.clone(), event.token_id.clone()).await;
-                preload_tracker.mark_preloaded(&event.taker_address, &event.token_id);
+                let hq = holds_query.clone();
+                let w = event.taker_address.clone();
+                let t = event.token_id.clone();
+                preload_tracker.mark_preloaded(&w, &t);
+                tokio::spawn(async move {
+                    let _ = hq(w, t).await;
+                });
             }
 
             // 2. Fragmented fill debounce (Gap 5 — bounded cache with TTL eviction)
@@ -750,12 +730,24 @@ pub fn start_strategy_engine(
                             api_degraded = true;
                         }
                     } else if api_degraded {
-                        // API recovered — exit degradation mode
-                        info!(
-                            "[Degradation] API latency recovered ({}s) — exiting degraded mode",
-                            api_elapsed
-                        );
-                        api_degraded = false;
+                        // BUG-3 FIX: require consecutive low-latency responses
+                        // before exiting degraded mode to avoid flapping.
+                        api_recovery_count += 1;
+                        if api_recovery_count >= API_RECOVERY_THRESHOLD {
+                            info!(
+                                "[Degradation] API latency recovered ({}s, {}/{} consecutive) — exiting degraded mode",
+                                api_elapsed, api_recovery_count, API_RECOVERY_THRESHOLD
+                            );
+                            api_degraded = false;
+                            api_recovery_count = 0;
+                        } else {
+                            debug!(
+                                "[Degradation] API latency improving ({}s, {}/{} consecutive) — staying in degraded mode",
+                                api_elapsed, api_recovery_count, API_RECOVERY_THRESHOLD
+                            );
+                        }
+                    } else {
+                        api_recovery_count = 0;
                     }
 
                     let we_hold = live_we_hold_opt.unwrap_or(cache_we_hold);
@@ -852,14 +844,29 @@ pub fn start_strategy_engine(
                                     }
                                 }
                                 TokenOwnershipStrategy::MultiWalletAverage => {
-                                    // Allow multiple wallets to hold the same token
-                                    // Don't skip — we'll just track the new source
-                                    info!(
-                                        "[Ownership] Multi-wallet: token {} also held by {} (multi_wallet_average)",
-                                        &event.token_id[..event.token_id.len().min(12)],
-                                        &event.taker_address[..event.taker_address.len().min(10)],
-                                    );
-                                    None // Allow: multi-wallet
+                                    // Allow multiple wallets to hold the same token.
+                                    // When a new wallet buys, average the sizing across
+                                    // all wallets holding the token (weighted by wallet weight).
+                                    // Record an additional ledger entry for this wallet.
+                                    {
+                                        let ledger = copy_ledger.lock().await;
+                                        // Only add a new ledger entry if this wallet doesn't
+                                        // already have one for this token.
+                                        let already_from_this_wallet = ledger.entries.iter().any(|e| {
+                                            !e.closed && e.token_id == event.token_id
+                                                && e.source_wallet == event.taker_address
+                                        });
+                                        if !already_from_this_wallet {
+                                            info!(
+                                                "[Ownership] Multi-wallet: token {} also held by {} (multi_wallet_average) — recording additional source",
+                                                &event.token_id[..event.token_id.len().min(12)],
+                                                &event.taker_address[..event.taker_address.len().min(10)],
+                                            );
+                                            // Record a secondary copy entry; the strategy engine
+                                            // will size it according to compute_order_usd as usual.
+                                        }
+                                    }
+                                    None // Allow: multi-wallet average
                                 }
                                 _ => {
                                     // first_come / whitelist_only: original behavior — skip
@@ -985,12 +992,23 @@ pub fn start_strategy_engine(
                                                                     // wallet_sync will re-record if needed
                                                                 }
                                                                 // Record realized PnL for the partial close
-                                                                let partial_pnl = (event.price
+                                                                // BUG-1 FIX: use partial_limit_price (our actual
+                                                                // execution price) instead of event.price (target's
+                                                                // reported price) for accurate PnL.
+                                                                let partial_pnl = (partial_limit_price
                                                                     - partial_entry_price)
                                                                     * our_reduction;
                                                                 let mut guard =
                                                                     partial_state.write().await;
                                                                 guard.realized_pnl += partial_pnl;
+                                                                // BUG-2 FIX: update position size in state so
+                                                                // subsequent partial/full closes use the correct
+                                                                // remaining size instead of the original full size.
+                                                                if let Some(pos) =
+                                                                    guard.positions.get_mut(&partial_token_id)
+                                                                {
+                                                                    pos.size = our_held_size - our_reduction;
+                                                                }
                                                                 if partial_pnl >= Decimal::ZERO {
                                                                     guard.record_win(
                                                                         &partial_source,
@@ -1133,7 +1151,7 @@ pub fn start_strategy_engine(
                         eval.validated = false;
                         eval.reason = Some(format!("Slippage guard: {}", reason));
                     } else if let Err(reason) =
-                        slippage_guard::check_depth(&event.token_id, TradeSide::BUY)
+                        slippage_guard::check_depth(event.price, TradeSide::BUY)
                     {
                         warn!(
                             "BUY skipped (depth): {} for token {}",

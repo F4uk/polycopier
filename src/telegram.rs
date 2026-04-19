@@ -14,6 +14,7 @@ pub struct TelegramNotifier {
     chat_id: String,
     min_pnl_usd: Decimal,
     enabled: bool,
+    client: reqwest::Client,
 }
 
 impl TelegramNotifier {
@@ -24,6 +25,10 @@ impl TelegramNotifier {
             chat_id: config.telegram_chat_id.clone(),
             min_pnl_usd: config.telegram_min_pnl_usd,
             enabled,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("Telegram HTTP client"),
         }
     }
 
@@ -43,10 +48,10 @@ impl TelegramNotifier {
             "parse_mode": "HTML"
         });
 
-        match reqwest::Client::new()
+        match self
+            .client
             .post(&url)
             .json(&body)
-            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
         {
